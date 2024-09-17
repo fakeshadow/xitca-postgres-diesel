@@ -1,15 +1,17 @@
+use std::error;
+
 use diesel::pg::PgTypeMetadata;
-use xitca_postgres::types::{private::BytesMut, IsNull, Type, WrongType};
+use xitca_postgres::types::{private::BytesMut, IsNull, ToSql, Type, WrongType};
 
 #[derive(Debug)]
 pub(super) struct ToSqlHelper(pub(super) PgTypeMetadata, pub(super) Option<Vec<u8>>);
 
-impl xitca_postgres::types::ToSql for ToSqlHelper {
+impl ToSql for ToSqlHelper {
     fn to_sql(
         &self,
         _ty: &Type,
         out: &mut BytesMut,
-    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>>
+    ) -> Result<IsNull, Box<dyn error::Error + Sync + Send>>
     where
         Self: Sized,
     {
@@ -33,7 +35,7 @@ impl xitca_postgres::types::ToSql for ToSqlHelper {
         &self,
         ty: &Type,
         out: &mut BytesMut,
-    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+    ) -> Result<IsNull, Box<dyn error::Error + Sync + Send>> {
         if Type::from_oid(self.0.oid()?)
             .map(|d| ty != &d)
             .unwrap_or(false)

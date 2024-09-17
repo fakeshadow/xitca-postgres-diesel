@@ -1,7 +1,16 @@
-use diesel::backend::Backend;
-use diesel::row::{Field, PartialRow, RowIndex, RowSealed};
-use std::{error::Error, num::NonZeroU32};
-use xitca_postgres::{compat::RowOwned, types::Type};
+use core::{num::NonZeroU32, ops::Range};
+
+use std::error;
+
+use diesel::{
+    backend::Backend,
+    pg::{Pg, PgValue, TypeOidLookup},
+    row::{Field, PartialRow, Row, RowIndex, RowSealed},
+};
+use xitca_postgres::{
+    compat::RowOwned,
+    types::{FromSql, Type},
+};
 
 pub struct PgRow {
     row: RowOwned,
@@ -14,7 +23,7 @@ impl PgRow {
 }
 impl RowSealed for PgRow {}
 
-impl<'a> diesel::row::Row<'a, diesel::pg::Pg> for PgRow {
+impl<'a> Row<'a, Pg> for PgRow {
     type Field<'b> = PgField<'b> where Self: 'b, 'a: 'b;
     type InnerPartialRow = Self;
 
@@ -25,7 +34,7 @@ impl<'a> diesel::row::Row<'a, diesel::pg::Pg> for PgRow {
     fn get<'b, I>(&'b self, idx: I) -> Option<Self::Field<'b>>
     where
         'a: 'b,
-        Self: diesel::row::RowIndex<I>,
+        Self: RowIndex<I>,
     {
         let idx = self.idx(idx)?;
         Some(PgField {
@@ -34,10 +43,7 @@ impl<'a> diesel::row::Row<'a, diesel::pg::Pg> for PgRow {
         })
     }
 
-    fn partial_row(
-        &self,
-        range: std::ops::Range<usize>,
-    ) -> diesel::row::PartialRow<Self::InnerPartialRow> {
+    fn partial_row(&self, range: Range<usize>) -> PartialRow<Self::InnerPartialRow> {
         PartialRow::new(self, range)
     }
 }
@@ -63,37 +69,34 @@ pub struct PgField<'a> {
     idx: usize,
 }
 
-impl<'a> Field<'a, diesel::pg::Pg> for PgField<'a> {
+impl<'a> Field<'a, Pg> for PgField<'a> {
     fn field_name(&self) -> Option<&str> {
         Some(self.row.columns()[self.idx].name())
     }
 
-    fn value(&self) -> Option<<diesel::pg::Pg as Backend>::RawValue<'_>> {
+    fn value(&self) -> Option<<Pg as Backend>::RawValue<'_>> {
         let DieselFromSqlWrapper(value) = self.row.get_raw(self.idx);
         value
     }
 }
 
-#[repr(transparent)]
-struct TyWrapper(Type);
+struct TyWrapper<'a>(&'a Type);
 
-impl diesel::pg::TypeOidLookup for TyWrapper {
+impl TypeOidLookup for TyWrapper<'_> {
     fn lookup(&self) -> NonZeroU32 {
         NonZeroU32::new(self.0.oid()).unwrap()
     }
 }
 
-struct DieselFromSqlWrapper<'a>(Option<diesel::pg::PgValue<'a>>);
+struct DieselFromSqlWrapper<'a>(Option<PgValue<'a>>);
 
-impl<'a> xitca_postgres::types::FromSql<'a> for DieselFromSqlWrapper<'a> {
-    fn from_sql(ty: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn Error + 'static + Send + Sync>> {
+impl<'a> FromSql<'a> for DieselFromSqlWrapper<'a> {
+    fn from_sql(ty: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn error::Error + Send + Sync>> {
         let ty = unsafe { &*(ty as *const Type as *const TyWrapper) };
-        Ok(DieselFromSqlWrapper(Some(diesel::pg::PgValue::new(
-            raw, ty,
-        ))))
+        Ok(DieselFromSqlWrapper(Some(PgValue::new(raw, ty))))
     }
 
-    fn from_sql_null(_ty: &Type) -> Result<Self, Box<dyn Error + Sync + Send>> {
+    fn from_sql_null(_ty: &Type) -> Result<Self, Box<dyn error::Error + Sync + Send>> {
         Ok(DieselFromSqlWrapper(None))
     }
 

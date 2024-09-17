@@ -1,36 +1,44 @@
 //! diesel-async api powered by xitca-postgres db driver
 
-use self::error_helper::ErrorHelper;
-use self::row::PgRow;
-use self::serialize::ToSqlHelper;
-use self::transaction_manager::AnsiTransactionManager;
-use crate::cache::{PrepareCallback, StmtCache};
-use diesel::connection::statement_cache::{PrepareForCache, StatementCacheKey};
-use diesel::connection::Instrumentation;
-use diesel::connection::InstrumentationEvent;
-use diesel::connection::StrQueryHelper;
-use diesel::pg::{
-    Pg, PgMetadataCache, PgMetadataCacheKey, PgMetadataLookup, PgQueryBuilder, PgTypeMetadata,
-};
-use diesel::query_builder::bind_collector::RawBytesBindCollector;
-use diesel::query_builder::{AsQuery, QueryBuilder, QueryFragment, QueryId};
-use diesel::result::{DatabaseErrorKind, Error};
-use diesel::{ConnectionError, ConnectionResult, QueryResult};
-use diesel_async::{AsyncConnection, SimpleAsyncConnection};
-use futures_util::future::BoxFuture;
-use futures_util::future::Either;
-use futures_util::stream::{BoxStream, TryStreamExt};
-use futures_util::TryFutureExt;
-use futures_util::{Future, FutureExt, StreamExt};
-use std::collections::{HashMap, HashSet};
-use std::future::IntoFuture;
-use std::sync::Arc;
-use tokio::sync::broadcast;
-use tokio::sync::Mutex;
-use xitca_postgres::compat::RowStreamOwned;
-use xitca_postgres::types::Type;
+use core::future::{Future, IntoFuture};
 
-pub use self::transaction_builder::TransactionBuilder;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
+
+use diesel::{
+    connection::{
+        statement_cache::{PrepareForCache, StatementCacheKey},
+        Instrumentation, InstrumentationEvent, StrQueryHelper,
+    },
+    pg::{
+        Pg, PgMetadataCache, PgMetadataCacheKey, PgMetadataLookup, PgQueryBuilder, PgTypeMetadata,
+    },
+    query_builder::{
+        bind_collector::RawBytesBindCollector, AsQuery, QueryBuilder, QueryFragment, QueryId,
+    },
+    result::{ConnectionError, ConnectionResult, DatabaseErrorKind, Error, QueryResult},
+};
+use diesel_async::{pooled_connection::PoolableConnection, AsyncConnection, SimpleAsyncConnection};
+use futures_util::{
+    future::{BoxFuture, Either, FutureExt, TryFutureExt},
+    stream::{BoxStream, StreamExt, TryStreamExt},
+};
+use tokio::sync::{broadcast, Mutex};
+use xitca_postgres::{
+    compat::{RowStreamOwned, StatementGuarded},
+    types::Type,
+    Client,
+};
+
+use cache::{PrepareCallback, StmtCache};
+use error_helper::ErrorHelper;
+use row::PgRow;
+use serialize::ToSqlHelper;
+use transaction_manager::AnsiTransactionManager;
+
+pub use transaction_builder::TransactionBuilder;
 
 mod cache;
 mod error_helper;
@@ -41,43 +49,16 @@ mod transaction_manager;
 
 const FAKE_OID: u32 = 0;
 
-type Statement = xitca_postgres::compat::StatementGuarded<Arc<xitca_postgres::Client>>;
+type Statement = StatementGuarded<Arc<Client>>;
 
 /// A connection to a PostgreSQL database.
 ///
 /// Connection URLs should be in the form
 /// `postgres://[user[:password]@]host/database_name`
 ///
-/// Checkout the documentation of the [tokio_postgres]
-/// crate for details about the format
+/// Checkout the documentation of the [xitca-postgres] crate for details about the format
 ///
-/// [tokio_postgres]: https://docs.rs/tokio-postgres/0.7.6/tokio_postgres/config/struct.Config.html#url
-///
-/// This connection supports *pipelined* requests. Pipelining can improve performance in use cases in which multiple,
-/// independent queries need to be executed. In a traditional workflow, each query is sent to the server after the
-/// previous query completes. In contrast, pipelining allows the client to send all of the queries to the server up
-/// front, minimizing time spent by one side waiting for the other to finish sending data:
-///
-/// ```not_rust
-///             Sequential                              Pipelined
-/// | Client         | Server          |    | Client         | Server          |
-/// |----------------|-----------------|    |----------------|-----------------|
-/// | send query 1   |                 |    | send query 1   |                 |
-/// |                | process query 1 |    | send query 2   | process query 1 |
-/// | receive rows 1 |                 |    | send query 3   | process query 2 |
-/// | send query 2   |                 |    | receive rows 1 | process query 3 |
-/// |                | process query 2 |    | receive rows 2 |                 |
-/// | receive rows 2 |                 |    | receive rows 3 |                 |
-/// | send query 3   |                 |
-/// |                | process query 3 |
-/// | receive rows 3 |                 |
-/// ```
-///
-/// In both cases, the PostgreSQL server is executing the queries **sequentially** - pipelining just allows both sides of
-/// the connection to work concurrently when possible.
-///
-/// Pipelining happens automatically when futures are polled concurrently (for example, by using the futures `join`
-/// combinator):
+/// [xitca-postgres]: https://github.com/HFQR/xitca-web/postgres
 ///
 /// ```rust
 /// # include!("../doctest_setup.rs");
@@ -107,8 +88,8 @@ type Statement = xitca_postgres::compat::StatementGuarded<Arc<xitca_postgres::Cl
 ///       # Ok(())
 /// # }
 pub struct AsyncPgConnection {
-    conn: Arc<xitca_postgres::Client>,
-    stmt_cache: Arc<Mutex<StmtCache<diesel::pg::Pg, Statement>>>,
+    conn: Arc<Client>,
+    stmt_cache: Arc<Mutex<StmtCache<Pg, Statement>>>,
     transaction_state: Arc<Mutex<AnsiTransactionManager>>,
     metadata_cache: Arc<Mutex<PgMetadataCache>>,
     connection_future: Option<broadcast::Receiver<Arc<xitca_postgres::Error>>>,
@@ -143,7 +124,7 @@ impl AsyncConnection for AsyncPgConnection {
     type LoadFuture<'conn, 'query> = BoxFuture<'query, QueryResult<Self::Stream<'conn, 'query>>>;
     type Stream<'conn, 'query> = BoxStream<'static, QueryResult<PgRow>>;
     type Row<'conn, 'query> = PgRow;
-    type Backend = diesel::pg::Pg;
+    type Backend = Pg;
     type TransactionManager = AnsiTransactionManager;
 
     async fn establish(database_url: &str) -> ConnectionResult<Self> {
@@ -223,7 +204,7 @@ impl AsyncConnection for AsyncPgConnection {
 }
 
 async fn load_prepared(
-    conn: Arc<xitca_postgres::Client>,
+    conn: Arc<Client>,
     stmt: Statement,
     binds: Vec<ToSqlHelper>,
 ) -> QueryResult<BoxStream<'static, QueryResult<PgRow>>> {
@@ -235,11 +216,11 @@ async fn load_prepared(
 }
 
 async fn execute_prepared(
-    conn: Arc<xitca_postgres::Client>,
+    conn: Arc<Client>,
     stmt: Statement,
     binds: Vec<ToSqlHelper>,
 ) -> QueryResult<usize> {
-    let res = xitca_postgres::Client::execute_raw(&conn, stmt.as_ref(), binds)
+    let res = Client::execute_raw(&conn, stmt.as_ref(), binds)
         .await
         .map_err(ErrorHelper)?;
     Ok(res as usize)
@@ -250,9 +231,7 @@ fn update_transaction_manager_status<T>(
     query_result: QueryResult<T>,
     transaction_manager: &mut AnsiTransactionManager,
 ) -> QueryResult<T> {
-    if let Err(diesel::result::Error::DatabaseError(DatabaseErrorKind::SerializationFailure, _)) =
-        query_result
-    {
+    if let Err(Error::DatabaseError(DatabaseErrorKind::SerializationFailure, _)) = query_result {
         transaction_manager
             .status
             .set_requires_rollback_maybe_up_to_top_level(true)
@@ -261,7 +240,7 @@ fn update_transaction_manager_status<T>(
 }
 
 #[async_trait::async_trait]
-impl PrepareCallback<Statement, PgTypeMetadata> for Arc<xitca_postgres::Client> {
+impl PrepareCallback<Statement, PgTypeMetadata> for Arc<Client> {
     async fn prepare(
         self,
         sql: &str,
@@ -273,21 +252,18 @@ impl PrepareCallback<Statement, PgTypeMetadata> for Arc<xitca_postgres::Client> 
             .map(type_from_oid)
             .collect::<QueryResult<Vec<_>>>()?;
 
-        let stmt = xitca_postgres::Client::prepare(&self, sql, &bind_types)
+        let stmt = Client::prepare(&self, sql, &bind_types)
             .await
             .map_err(ErrorHelper)?
             .leak();
-        Ok((
-            xitca_postgres::compat::StatementGuarded::new(stmt, self.clone()),
-            self,
-        ))
+        Ok((StatementGuarded::new(stmt, self.clone()), self))
     }
 }
 
 fn type_from_oid(t: &PgTypeMetadata) -> QueryResult<Type> {
     let oid = t
         .oid()
-        .map_err(|e| diesel::result::Error::SerializationError(Box::new(e) as _))?;
+        .map_err(|e| Error::SerializationError(Box::new(e) as _))?;
 
     if let Some(tpe) = Type::from_oid(oid) {
         return Ok(tpe);
@@ -333,7 +309,7 @@ impl AsyncPgConnection {
     }
 
     /// Construct a new `AsyncPgConnection` instance from an existing [`tokio_postgres::Client`]
-    pub async fn try_from(conn: xitca_postgres::Client) -> ConnectionResult<Self> {
+    pub async fn try_from(conn: Client) -> ConnectionResult<Self> {
         Self::setup(
             conn,
             None,
@@ -345,7 +321,7 @@ impl AsyncPgConnection {
     }
 
     async fn setup(
-        conn: xitca_postgres::Client,
+        conn: Client,
         connection_future: Option<broadcast::Receiver<Arc<xitca_postgres::Error>>>,
         instrumentation: Arc<std::sync::Mutex<Option<Box<dyn Instrumentation>>>>,
     ) -> ConnectionResult<Self> {
@@ -388,10 +364,10 @@ impl AsyncPgConnection {
     fn with_prepared_statement<'a, T, F, R>(
         &mut self,
         query: T,
-        callback: fn(Arc<xitca_postgres::Client>, Statement, Vec<ToSqlHelper>) -> F,
+        callback: fn(Arc<Client>, Statement, Vec<ToSqlHelper>) -> F,
     ) -> BoxFuture<'a, QueryResult<R>>
     where
-        T: QueryFragment<diesel::pg::Pg> + QueryId,
+        T: QueryFragment<Pg> + QueryId,
         F: Future<Output = QueryResult<R>> + Send + 'a,
         R: Send,
     {
@@ -422,7 +398,7 @@ impl AsyncPgConnection {
 
     fn with_prepared_statement_after_sql_built<'a, F, R>(
         &mut self,
-        callback: fn(Arc<xitca_postgres::Client>, Statement, Vec<ToSqlHelper>) -> F,
+        callback: fn(Arc<Client>, Statement, Vec<ToSqlHelper>) -> F,
         is_safe_to_cache_prepared: QueryResult<bool>,
         query_id: Option<std::any::TypeId>,
         to_sql_result: QueryResult<()>,
@@ -531,8 +507,8 @@ impl AsyncPgConnection {
                     .into_iter()
                     .zip(bind_collector.binds)
                     .map(|(meta, bind)| ToSqlHelper(meta, bind))
-                    .collect::<Vec<_>>();
-                callback(raw_connection, stmt.clone(), binds).await
+                    .collect();
+                callback(raw_connection, stmt, binds).await
             };
             let res = res.await;
             let mut tm = tm.lock().await;
@@ -565,7 +541,7 @@ struct BindData {
     bind_collector: RawBytesBindCollector<Pg>,
 }
 
-fn construct_bind_data(query: &dyn QueryFragment<diesel::pg::Pg>) -> BindData {
+fn construct_bind_data(query: &dyn QueryFragment<Pg>) -> BindData {
     // we don't resolve custom types here yet, we do that later
     // in the async block below as we might need to perform lookup
     // queries for that.
@@ -575,7 +551,7 @@ fn construct_bind_data(query: &dyn QueryFragment<diesel::pg::Pg>) -> BindData {
     //
     // We give out constant fake oids here to optimize for the "happy" path
     // without custom type lookup
-    let mut bind_collector_0 = RawBytesBindCollector::<diesel::pg::Pg>::new();
+    let mut bind_collector_0 = RawBytesBindCollector::<Pg>::new();
     let mut metadata_lookup_0 = PgAsyncMetadataLookup {
         custom_oid: false,
         generated_oids: None,
@@ -819,7 +795,7 @@ async fn drive_future<R>(
     }
 }
 
-impl diesel_async::pooled_connection::PoolableConnection for AsyncPgConnection {
+impl PoolableConnection for AsyncPgConnection {
     fn is_broken(&mut self) -> bool {
         use diesel_async::TransactionManager;
 
