@@ -1,6 +1,4 @@
 // use std::error::Error;
-use std::sync::Arc;
-
 use diesel::ConnectionError;
 
 pub(super) struct ErrorHelper(pub(super) xitca_postgres::Error);
@@ -13,12 +11,12 @@ impl From<ErrorHelper> for ConnectionError {
 
 impl From<ErrorHelper> for diesel::result::Error {
     fn from(ErrorHelper(postgres_error): ErrorHelper) -> Self {
-        from_tokio_postgres_error(Arc::new(postgres_error))
+        from_tokio_postgres_error(&postgres_error)
     }
 }
 
 pub(super) fn from_tokio_postgres_error(
-    postgres_error: Arc<xitca_postgres::Error>,
+    postgres_error: &xitca_postgres::Error,
 ) -> diesel::result::Error {
     // use diesel::result::DatabaseErrorKind::*;
     // use xitca_postgres::error::SqlState;

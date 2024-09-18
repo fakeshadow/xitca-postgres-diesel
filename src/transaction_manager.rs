@@ -10,7 +10,8 @@ use diesel::{
     result::{Error, QueryResult},
 };
 use diesel_async::{AsyncConnection, TransactionManager};
-use futures_util::future::BoxFuture;
+
+use crate::BoxFuture;
 
 /// An implementation of `TransactionManager` which can be used for backends
 /// which use ANSI standard syntax for savepoints such as SQLite and PostgreSQL.

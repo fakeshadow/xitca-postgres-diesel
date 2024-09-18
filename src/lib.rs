@@ -1,6 +1,17 @@
 //! diesel-async api powered by xitca-postgres db driver
 
-use core::future::{Future, IntoFuture};
+mod cache;
+mod error_helper;
+mod row;
+mod serialize;
+mod stream;
+mod transaction_builder;
+mod transaction_manager;
+
+use core::{
+    future::{Future, IntoFuture},
+    pin::Pin,
+};
 
 use std::{
     collections::{HashMap, HashSet},
@@ -20,16 +31,9 @@ use diesel::{
     result::{ConnectionError, ConnectionResult, DatabaseErrorKind, Error, QueryResult},
 };
 use diesel_async::{pooled_connection::PoolableConnection, AsyncConnection, SimpleAsyncConnection};
-use futures_util::{
-    future::BoxFuture,
-    stream::{BoxStream, StreamExt, TryStreamExt},
-};
-use tokio::sync::{broadcast, Mutex};
-use xitca_postgres::{
-    compat::{RowStreamOwned, StatementGuarded},
-    types::Type,
-    Client,
-};
+use stream::RowStream;
+use tokio::{sync::Mutex, task::JoinHandle};
+use xitca_postgres::{compat::StatementGuarded, types::Type, Client};
 
 use cache::{PrepareCallback, StmtCache};
 use error_helper::ErrorHelper;
@@ -39,16 +43,11 @@ use transaction_manager::AnsiTransactionManager;
 
 pub use transaction_builder::TransactionBuilder;
 
-mod cache;
-mod error_helper;
-mod row;
-mod serialize;
-mod transaction_builder;
-mod transaction_manager;
-
 const FAKE_OID: u32 = 0;
 
 pub(crate) type Statement = StatementGuarded<Arc<Client>>;
+
+type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// A connection to a PostgreSQL database.
 ///
@@ -91,7 +90,7 @@ pub struct AsyncPgConnection {
     stmt_cache: Arc<Mutex<StmtCache>>,
     transaction_state: Arc<Mutex<AnsiTransactionManager>>,
     metadata_cache: Arc<Mutex<PgMetadataCache>>,
-    error_joiner: Option<broadcast::Receiver<Arc<xitca_postgres::Error>>>,
+    error_joiner: ErrorJoiner,
     // a sync mutex is fine here as we only hold it for a really short time
     instrumentation: Arc<std::sync::Mutex<Option<Box<dyn Instrumentation>>>>,
 }
@@ -105,12 +104,11 @@ impl SimpleAsyncConnection for AsyncPgConnection {
         self.record_instrumentation(InstrumentationEvent::start_query(&StrQueryHelper::new(
             query,
         )));
-        let error_joiner = self.error_joiner.as_ref().map(|rx| rx.resubscribe());
         let batch_execute = self.conn.execute_simple(query);
         Box::pin(async {
             let res = match batch_execute.await {
                 Ok(_) => Ok(()),
-                Err(e) => Err(error_joiner.join(e).await),
+                Err(e) => Err(self.error_joiner.join(e).await),
             };
 
             self.record_instrumentation(InstrumentationEvent::finish_query(
@@ -126,7 +124,7 @@ impl SimpleAsyncConnection for AsyncPgConnection {
 impl AsyncConnection for AsyncPgConnection {
     type ExecuteFuture<'conn, 'query> = BoxFuture<'query, QueryResult<usize>>;
     type LoadFuture<'conn, 'query> = BoxFuture<'query, QueryResult<Self::Stream<'conn, 'query>>>;
-    type Stream<'conn, 'query> = BoxStream<'static, QueryResult<PgRow>>;
+    type Stream<'conn, 'query> = RowStream;
     type Row<'conn, 'query> = PgRow;
     type Backend = Pg;
     type TransactionManager = AnsiTransactionManager;
@@ -146,18 +144,21 @@ impl AsyncConnection for AsyncPgConnection {
                 .await
                 .map_err(ErrorHelper)?;
 
-            let (tx, rx) = broadcast::channel(1);
-            tokio::spawn(async move {
-                // TODO: diesel async should be treat driver graceful shutdown as non error.
-                let e = driver
+            let handle = tokio::spawn(async move {
+                driver
                     .into_future()
                     .await
+                    // TODO: diesel async should be treat driver graceful shutdown as non error.
                     .err()
-                    .unwrap_or_else(|| xitca_postgres::error::DriverDown.into());
-                let _ = tx.send(Arc::new(e));
+                    .unwrap_or_else(|| xitca_postgres::error::DriverDown.into())
             });
 
-            let r = Self::setup(client, Some(rx), Arc::clone(&instrumentation)).await;
+            let r = Self::setup(
+                client,
+                ErrorJoiner::new(Some(handle)),
+                Arc::clone(&instrumentation),
+            )
+            .await;
             instrumentation
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -215,12 +216,8 @@ async fn load_prepared(
     conn: Arc<Client>,
     stmt: Statement,
     binds: Vec<ToSqlHelper>,
-) -> Result<BoxStream<'static, Result<PgRow, Error>>, xitca_postgres::Error> {
-    let res = conn.query_raw(stmt.as_ref(), binds)?;
-    Ok(RowStreamOwned::from(res)
-        .map_ok(PgRow::new)
-        .map_err(|e| Error::from(ErrorHelper(e)))
-        .boxed())
+) -> Result<RowStream, xitca_postgres::Error> {
+    conn.query_raw(stmt.as_ref(), binds).map(RowStream::from)
 }
 
 async fn execute_prepared(
@@ -228,8 +225,7 @@ async fn execute_prepared(
     stmt: Statement,
     binds: Vec<ToSqlHelper>,
 ) -> Result<usize, xitca_postgres::Error> {
-    let res = Client::execute_raw(&conn, stmt.as_ref(), binds).await?;
-    Ok(res as usize)
+    conn.execute_raw(&stmt, binds).await.map(|n| n as _)
 }
 
 #[inline(always)]
@@ -312,7 +308,7 @@ impl AsyncPgConnection {
     pub async fn try_from(conn: Client) -> ConnectionResult<Self> {
         Self::setup(
             conn,
-            None,
+            ErrorJoiner::new(None),
             Arc::new(std::sync::Mutex::new(
                 diesel::connection::get_default_instrumentation(),
             )),
@@ -322,7 +318,7 @@ impl AsyncPgConnection {
 
     async fn setup(
         conn: Client,
-        connection_future: Option<broadcast::Receiver<Arc<xitca_postgres::Error>>>,
+        error_joiner: ErrorJoiner,
         instrumentation: Arc<std::sync::Mutex<Option<Box<dyn Instrumentation>>>>,
     ) -> ConnectionResult<Self> {
         let mut conn = Self {
@@ -330,7 +326,7 @@ impl AsyncPgConnection {
             stmt_cache: Arc::new(Mutex::new(StmtCache::new())),
             transaction_state: Arc::new(Mutex::new(AnsiTransactionManager::default())),
             metadata_cache: Arc::new(Mutex::new(PgMetadataCache::new())),
-            error_joiner: connection_future,
+            error_joiner,
             instrumentation,
         };
         conn.set_config_options()
@@ -412,7 +408,7 @@ impl AsyncPgConnection {
             generated_oids,
             mut bind_collector,
         } = bind_data;
-        let error_joiner = self.error_joiner.as_ref().map(|rx| rx.resubscribe());
+        let error_joiner = self.error_joiner.clone();
 
         Box::pin(async move {
             let sql = to_sql_result.map(|_| query_builder.finish())?;
@@ -526,25 +522,47 @@ impl AsyncPgConnection {
 }
 
 /// transform xitca_postgres::Error to diesel::result::Error on certain condition.
-trait JoinError: Sized {
-    fn join(self, e: xitca_postgres::Error) -> BoxFuture<'static, Error>;
+#[derive(Clone)]
+struct ErrorJoiner {
+    handle: Option<Arc<Mutex<JoinerInner>>>,
 }
 
-impl JoinError for Option<broadcast::Receiver<Arc<xitca_postgres::Error>>> {
+enum JoinerInner {
+    Handle(JoinHandle<xitca_postgres::Error>),
+    Error(xitca_postgres::Error),
+}
+
+impl ErrorJoiner {
+    fn new(handle: Option<JoinHandle<xitca_postgres::Error>>) -> Self {
+        Self {
+            handle: handle.map(|handle| Arc::new(Mutex::new(JoinerInner::Handle(handle)))),
+        }
+    }
+
     #[cold]
     #[inline(never)]
-    fn join(self, e: xitca_postgres::Error) -> BoxFuture<'static, Error> {
-        Box::pin(async {
+    fn join(&self, e: xitca_postgres::Error) -> BoxFuture<'_, Error> {
+        Box::pin(async move {
             // when xitca_postgres emit driver shutdown error it means it's Driver
             // task has shutdown already. in this case just await for the driver error
-            // to showup and replace client's error type.
+            // to show up from join handle and replace client's error type.
             if e.is_driver_down() {
-                if let Some(mut rx) = self {
-                    let e = rx.recv().await.unwrap();
-                    return error_helper::from_tokio_postgres_error(e);
+                if let Some(ref inner) = self.handle {
+                    let mut inner = inner.lock().await;
+                    return match *inner {
+                        JoinerInner::Error(ref e) => error_helper::from_tokio_postgres_error(e),
+                        JoinerInner::Handle(ref mut handle) => {
+                            let err = Box::pin(handle)
+                                .await
+                                .expect("Driver's task must not panic");
+                            let e = error_helper::from_tokio_postgres_error(&err);
+                            let _ = core::mem::replace(&mut *inner, JoinerInner::Error(err));
+                            e
+                        }
+                    };
                 }
             }
-            ErrorHelper(e).into()
+            error_helper::from_tokio_postgres_error(&e)
         })
     }
 }
