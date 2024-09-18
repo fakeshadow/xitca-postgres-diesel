@@ -70,22 +70,25 @@ pub(crate) fn into_error(e: xitca_postgres::Error) -> Error {
 fn into_error_ref(e: &xitca_postgres::Error) -> Error {
     use diesel::result::DatabaseErrorKind::*;
 
-    match e.downcast_ref::<xitca_postgres::error::DbError>() {
-        Some(e) => {
-            use xitca_postgres::error::SqlState;
-            let kind = match *e.code() {
-                SqlState::UNIQUE_VIOLATION => UniqueViolation,
-                SqlState::FOREIGN_KEY_VIOLATION => ForeignKeyViolation,
-                SqlState::T_R_SERIALIZATION_FAILURE => SerializationFailure,
-                SqlState::READ_ONLY_SQL_TRANSACTION => ReadOnlyTransaction,
-                SqlState::NOT_NULL_VIOLATION => NotNullViolation,
-                SqlState::CHECK_VIOLATION => CheckViolation,
-                _ => Unknown,
-            };
-            Error::DatabaseError(kind, Box::new(PostgresDbErrorWrapper(e.clone())) as _)
-        }
-        None => Error::DatabaseError(UnableToSendCommand, Box::new(e.to_string())),
+    if e.is_driver_down() {
+        return Error::DatabaseError(ClosedConnection, Box::new(e.to_string()));
     }
+
+    if let Some(e) = e.downcast_ref::<xitca_postgres::error::DbError>() {
+        use xitca_postgres::error::SqlState;
+        let kind = match *e.code() {
+            SqlState::UNIQUE_VIOLATION => UniqueViolation,
+            SqlState::FOREIGN_KEY_VIOLATION => ForeignKeyViolation,
+            SqlState::T_R_SERIALIZATION_FAILURE => SerializationFailure,
+            SqlState::READ_ONLY_SQL_TRANSACTION => ReadOnlyTransaction,
+            SqlState::NOT_NULL_VIOLATION => NotNullViolation,
+            SqlState::CHECK_VIOLATION => CheckViolation,
+            _ => Unknown,
+        };
+        return Error::DatabaseError(kind, Box::new(PostgresDbErrorWrapper(e.clone())) as _);
+    }
+
+    Error::DatabaseError(UnableToSendCommand, Box::new(e.to_string()))
 }
 
 struct PostgresDbErrorWrapper(xitca_postgres::error::DbError);

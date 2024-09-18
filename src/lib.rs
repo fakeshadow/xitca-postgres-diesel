@@ -1,5 +1,8 @@
 //! diesel-async api powered by xitca-postgres db driver
 
+#[doc(hidden)]
+pub mod pool;
+
 mod cache;
 mod error;
 mod row;
