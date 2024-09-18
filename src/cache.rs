@@ -1,69 +1,54 @@
-use core::hash::Hash;
+use core::future::Future;
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use diesel::{
-    backend::Backend,
-    connection::{
-        statement_cache::{MaybeCached, PrepareForCache, StatementCacheKey},
-        Instrumentation, InstrumentationEvent,
-    },
+    connection::{statement_cache::StatementCacheKey, Instrumentation, InstrumentationEvent},
+    pg::{Pg, PgTypeMetadata},
     result::QueryResult,
 };
+use xitca_postgres::Client;
+
+use crate::Statement;
 
 #[derive(Default)]
-pub struct StmtCache<DB: Backend, S> {
-    cache: HashMap<StatementCacheKey<DB>, S>,
+pub struct StmtCache {
+    cache: HashMap<StatementCacheKey<Pg>, Statement>,
 }
 
-#[async_trait::async_trait]
-pub trait PrepareCallback<S, M>: Sized {
-    async fn prepare(
-        self,
+pub trait PrepareCallback {
+    fn prepare(
+        &self,
         sql: &str,
-        metadata: &[M],
-        is_for_cache: PrepareForCache,
-    ) -> QueryResult<(S, Self)>;
+        metadata: &[PgTypeMetadata],
+    ) -> impl Future<Output = QueryResult<Statement>> + Send;
 }
 
-impl<S, DB: Backend> StmtCache<DB, S> {
+impl StmtCache {
     pub fn new() -> Self {
         Self {
             cache: HashMap::new(),
         }
     }
 
-    pub async fn cached_prepared_statement<'a, F>(
-        &'a mut self,
-        cache_key: StatementCacheKey<DB>,
+    pub async fn cached_prepared_statement(
+        &mut self,
+        cache_key: StatementCacheKey<Pg>,
         sql: String,
         is_query_safe_to_cache: bool,
-        metadata: &[DB::TypeMetadata],
-        prepare_fn: F,
+        metadata: &[PgTypeMetadata],
+        prepare_fn: &Arc<Client>,
         instrumentation: &std::sync::Mutex<Option<Box<dyn Instrumentation>>>,
-    ) -> QueryResult<(MaybeCached<'a, S>, F)>
-    where
-        S: Send,
-        DB::QueryBuilder: Default,
-        DB::TypeMetadata: Clone + Send + Sync,
-        F: PrepareCallback<S, DB::TypeMetadata> + Send + 'a,
-        StatementCacheKey<DB>: Hash + Eq,
-    {
+    ) -> QueryResult<Statement> {
         use std::collections::hash_map::Entry::{Occupied, Vacant};
 
         if !is_query_safe_to_cache {
             let metadata = metadata.to_vec();
-            return Box::pin(async move {
-                prepare_fn
-                    .prepare(&sql, &metadata, PrepareForCache::No)
-                    .await
-                    .map(|stmt| (MaybeCached::CannotCache(stmt.0), stmt.1))
-            })
-            .await;
+            return Box::pin(prepare_fn.prepare(&sql, &metadata)).await;
         }
 
         match self.cache.entry(cache_key) {
-            Occupied(entry) => Ok((MaybeCached::Cached(entry.into_mut()), prepare_fn)),
+            Occupied(entry) => Ok(entry.into_mut().clone()),
             Vacant(entry) => {
                 let metadata = metadata.to_vec();
                 instrumentation
@@ -71,10 +56,9 @@ impl<S, DB: Backend> StmtCache<DB, S> {
                     .unwrap_or_else(|p| p.into_inner())
                     .on_connection_event(InstrumentationEvent::cache_query(&sql));
                 Box::pin(async move {
-                    prepare_fn
-                        .prepare(&sql, &metadata, PrepareForCache::Yes)
-                        .await
-                        .map(|stmt| (MaybeCached::Cached(entry.insert(stmt.0)), stmt.1))
+                    prepare_fn.prepare(&sql, &metadata).await.inspect(|stmt| {
+                        entry.insert(stmt.clone());
+                    })
                 })
                 .await
             }

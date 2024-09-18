@@ -9,8 +9,7 @@ use std::{
 
 use diesel::{
     connection::{
-        statement_cache::{PrepareForCache, StatementCacheKey},
-        Instrumentation, InstrumentationEvent, StrQueryHelper,
+        statement_cache::StatementCacheKey, Instrumentation, InstrumentationEvent, StrQueryHelper,
     },
     pg::{
         Pg, PgMetadataCache, PgMetadataCacheKey, PgMetadataLookup, PgQueryBuilder, PgTypeMetadata,
@@ -22,7 +21,7 @@ use diesel::{
 };
 use diesel_async::{pooled_connection::PoolableConnection, AsyncConnection, SimpleAsyncConnection};
 use futures_util::{
-    future::{BoxFuture, Either, FutureExt, TryFutureExt},
+    future::BoxFuture,
     stream::{BoxStream, StreamExt, TryStreamExt},
 };
 use tokio::sync::{broadcast, Mutex};
@@ -49,7 +48,7 @@ mod transaction_manager;
 
 const FAKE_OID: u32 = 0;
 
-type Statement = StatementGuarded<Arc<Client>>;
+pub(crate) type Statement = StatementGuarded<Arc<Client>>;
 
 /// A connection to a PostgreSQL database.
 ///
@@ -89,36 +88,41 @@ type Statement = StatementGuarded<Arc<Client>>;
 /// # }
 pub struct AsyncPgConnection {
     conn: Arc<Client>,
-    stmt_cache: Arc<Mutex<StmtCache<Pg, Statement>>>,
+    stmt_cache: Arc<Mutex<StmtCache>>,
     transaction_state: Arc<Mutex<AnsiTransactionManager>>,
     metadata_cache: Arc<Mutex<PgMetadataCache>>,
-    connection_future: Option<broadcast::Receiver<Arc<xitca_postgres::Error>>>,
+    error_joiner: Option<broadcast::Receiver<Arc<xitca_postgres::Error>>>,
     // a sync mutex is fine here as we only hold it for a really short time
     instrumentation: Arc<std::sync::Mutex<Option<Box<dyn Instrumentation>>>>,
 }
 
-#[async_trait::async_trait]
 impl SimpleAsyncConnection for AsyncPgConnection {
-    async fn batch_execute(&mut self, query: &str) -> QueryResult<()> {
+    fn batch_execute<'s, 'q, 'f>(&'s mut self, query: &'q str) -> BoxFuture<'f, QueryResult<()>>
+    where
+        's: 'f,
+        'q: 'f,
+    {
         self.record_instrumentation(InstrumentationEvent::start_query(&StrQueryHelper::new(
             query,
         )));
-        let connection_future = self.connection_future.as_ref().map(|rx| rx.resubscribe());
-        let batch_execute = self
-            .conn
-            .execute_simple(query)
-            .map_err(ErrorHelper)
-            .map_err(Into::into);
-        let r = drive_future(connection_future, batch_execute).await;
-        self.record_instrumentation(InstrumentationEvent::finish_query(
-            &StrQueryHelper::new(query),
-            r.as_ref().err(),
-        ));
-        r.map(|_| ())
+        let error_joiner = self.error_joiner.as_ref().map(|rx| rx.resubscribe());
+        let batch_execute = self.conn.execute_simple(query);
+        Box::pin(async {
+            let res = match batch_execute.await {
+                Ok(_) => Ok(()),
+                Err(e) => Err(error_joiner.join(e).await),
+            };
+
+            self.record_instrumentation(InstrumentationEvent::finish_query(
+                &StrQueryHelper::new(query),
+                res.as_ref().err(),
+            ));
+
+            res
+        })
     }
 }
 
-#[async_trait::async_trait]
 impl AsyncConnection for AsyncPgConnection {
     type ExecuteFuture<'conn, 'query> = BoxFuture<'query, QueryResult<usize>>;
     type LoadFuture<'conn, 'query> = BoxFuture<'query, QueryResult<Self::Stream<'conn, 'query>>>;
@@ -127,32 +131,42 @@ impl AsyncConnection for AsyncPgConnection {
     type Backend = Pg;
     type TransactionManager = AnsiTransactionManager;
 
-    async fn establish(database_url: &str) -> ConnectionResult<Self> {
+    fn establish<'d, 'f>(database_url: &'d str) -> BoxFuture<'f, ConnectionResult<Self>>
+    where
+        'd: 'f,
+    {
         let mut instrumentation = diesel::connection::get_default_instrumentation();
         instrumentation.on_connection_event(InstrumentationEvent::start_establish_connection(
             database_url,
         ));
         let instrumentation = Arc::new(std::sync::Mutex::new(instrumentation));
-        let (client, driver) = xitca_postgres::Postgres::new(database_url)
-            .connect()
-            .await
-            .map_err(ErrorHelper)?;
-        let (tx, rx) = tokio::sync::broadcast::channel(1);
-        tokio::spawn(async move {
-            if let Err(e) = driver.into_future().await {
-                let _ = tx.send(Arc::new(e));
-            }
-        });
+        Box::pin(async move {
+            let (client, driver) = xitca_postgres::Postgres::new(database_url)
+                .connect()
+                .await
+                .map_err(ErrorHelper)?;
 
-        let r = Self::setup(client, Some(rx), Arc::clone(&instrumentation)).await;
-        instrumentation
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .on_connection_event(InstrumentationEvent::finish_establish_connection(
-                database_url,
-                r.as_ref().err(),
-            ));
-        r
+            let (tx, rx) = broadcast::channel(1);
+            tokio::spawn(async move {
+                // TODO: diesel async should be treat driver graceful shutdown as non error.
+                let e = driver
+                    .into_future()
+                    .await
+                    .err()
+                    .unwrap_or_else(|| xitca_postgres::error::DriverDown.into());
+                let _ = tx.send(Arc::new(e));
+            });
+
+            let r = Self::setup(client, Some(rx), Arc::clone(&instrumentation)).await;
+            instrumentation
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .on_connection_event(InstrumentationEvent::finish_establish_connection(
+                    database_url,
+                    r.as_ref().err(),
+                ));
+            r
+        })
     }
 
     fn load<'conn, 'query, T>(&'conn mut self, source: T) -> Self::LoadFuture<'conn, 'query>
@@ -160,9 +174,7 @@ impl AsyncConnection for AsyncPgConnection {
         T: AsQuery + 'query,
         T::Query: QueryFragment<Self::Backend> + QueryId + 'query,
     {
-        let query = source.as_query();
-        let load_future = self.with_prepared_statement(query, load_prepared);
-        self.run_with_connection_future(load_future)
+        self.with_prepared_statement(source.as_query(), load_prepared)
     }
 
     fn execute_returning_count<'conn, 'query, T>(
@@ -172,30 +184,26 @@ impl AsyncConnection for AsyncPgConnection {
     where
         T: QueryFragment<Self::Backend> + QueryId + 'query,
     {
-        let execute = self.with_prepared_statement(source, execute_prepared);
-        self.run_with_connection_future(execute)
+        self.with_prepared_statement(source, execute_prepared)
     }
 
     fn transaction_state(&mut self) -> &mut AnsiTransactionManager {
         // there should be no other pending future when this is called
         // that means there is only one instance of this arc and
         // we can simply access the inner data
-        if let Some(tm) = Arc::get_mut(&mut self.transaction_state) {
-            tm.get_mut()
-        } else {
-            panic!("Cannot access shared transaction state")
-        }
+        Arc::get_mut(&mut self.transaction_state)
+            .expect("Cannot access shared transaction state")
+            .get_mut()
     }
 
     fn instrumentation(&mut self) -> &mut dyn Instrumentation {
         // there should be no other pending future when this is called
         // that means there is only one instance of this arc and
         // we can simply access the inner data
-        if let Some(instrumentation) = Arc::get_mut(&mut self.instrumentation) {
-            instrumentation.get_mut().unwrap_or_else(|p| p.into_inner())
-        } else {
-            panic!("Cannot access shared instrumentation")
-        }
+        Arc::get_mut(&mut self.instrumentation)
+            .expect("Cannot access shared instrumentation")
+            .get_mut()
+            .unwrap_or_else(|p| p.into_inner())
     }
 
     fn set_instrumentation(&mut self, instrumentation: impl Instrumentation) {
@@ -207,11 +215,11 @@ async fn load_prepared(
     conn: Arc<Client>,
     stmt: Statement,
     binds: Vec<ToSqlHelper>,
-) -> QueryResult<BoxStream<'static, QueryResult<PgRow>>> {
-    let res = conn.query_raw(stmt.as_ref(), binds).map_err(ErrorHelper)?;
+) -> Result<BoxStream<'static, Result<PgRow, Error>>, xitca_postgres::Error> {
+    let res = conn.query_raw(stmt.as_ref(), binds)?;
     Ok(RowStreamOwned::from(res)
-        .map_err(|e| diesel::result::Error::from(ErrorHelper(e)))
         .map_ok(PgRow::new)
+        .map_err(|e| Error::from(ErrorHelper(e)))
         .boxed())
 }
 
@@ -219,10 +227,8 @@ async fn execute_prepared(
     conn: Arc<Client>,
     stmt: Statement,
     binds: Vec<ToSqlHelper>,
-) -> QueryResult<usize> {
-    let res = Client::execute_raw(&conn, stmt.as_ref(), binds)
-        .await
-        .map_err(ErrorHelper)?;
+) -> Result<usize, xitca_postgres::Error> {
+    let res = Client::execute_raw(&conn, stmt.as_ref(), binds).await?;
     Ok(res as usize)
 }
 
@@ -239,24 +245,18 @@ fn update_transaction_manager_status<T>(
     query_result
 }
 
-#[async_trait::async_trait]
-impl PrepareCallback<Statement, PgTypeMetadata> for Arc<Client> {
-    async fn prepare(
-        self,
-        sql: &str,
-        metadata: &[PgTypeMetadata],
-        _is_for_cache: PrepareForCache,
-    ) -> QueryResult<(Statement, Self)> {
+impl PrepareCallback for Arc<Client> {
+    async fn prepare(&self, sql: &str, metadata: &[PgTypeMetadata]) -> QueryResult<Statement> {
         let bind_types = metadata
             .iter()
             .map(type_from_oid)
             .collect::<QueryResult<Vec<_>>>()?;
 
-        let stmt = Client::prepare(&self, sql, &bind_types)
+        let stmt = Client::prepare(self, sql, &bind_types)
             .await
             .map_err(ErrorHelper)?
             .leak();
-        Ok((StatementGuarded::new(stmt, self.clone()), self))
+        Ok(StatementGuarded::new(stmt, self.clone()))
     }
 }
 
@@ -330,7 +330,7 @@ impl AsyncPgConnection {
             stmt_cache: Arc::new(Mutex::new(StmtCache::new())),
             transaction_state: Arc::new(Mutex::new(AnsiTransactionManager::default())),
             metadata_cache: Arc::new(Mutex::new(PgMetadataCache::new())),
-            connection_future,
+            error_joiner: connection_future,
             instrumentation,
         };
         conn.set_config_options()
@@ -353,14 +353,6 @@ impl AsyncPgConnection {
         Ok(())
     }
 
-    fn run_with_connection_future<'a, R: 'a>(
-        &self,
-        future: impl Future<Output = QueryResult<R>> + Send + 'a,
-    ) -> BoxFuture<'a, QueryResult<R>> {
-        let connection_future = self.connection_future.as_ref().map(|rx| rx.resubscribe());
-        drive_future(connection_future, future).boxed()
-    }
-
     fn with_prepared_statement<'a, T, F, R>(
         &mut self,
         query: T,
@@ -368,7 +360,7 @@ impl AsyncPgConnection {
     ) -> BoxFuture<'a, QueryResult<R>>
     where
         T: QueryFragment<Pg> + QueryId,
-        F: Future<Output = QueryResult<R>> + Send + 'a,
+        F: Future<Output = Result<R, xitca_postgres::Error>> + Send + 'a,
         R: Send,
     {
         self.record_instrumentation(InstrumentationEvent::start_query(&diesel::debug_query(
@@ -406,7 +398,7 @@ impl AsyncPgConnection {
         bind_data: BindData,
     ) -> BoxFuture<'a, QueryResult<R>>
     where
-        F: Future<Output = QueryResult<R>> + Send + 'a,
+        F: Future<Output = Result<R, xitca_postgres::Error>> + Send + 'a,
         R: Send,
     {
         let raw_connection = self.conn.clone();
@@ -420,8 +412,9 @@ impl AsyncPgConnection {
             generated_oids,
             mut bind_collector,
         } = bind_data;
+        let error_joiner = self.error_joiner.as_ref().map(|rx| rx.resubscribe());
 
-        async move {
+        Box::pin(async move {
             let sql = to_sql_result.map(|_| query_builder.finish())?;
             let res = async {
                 let is_safe_to_cache_prepared = is_safe_to_cache_prepared?;
@@ -434,8 +427,7 @@ impl AsyncPgConnection {
                     let metadata_cache = &mut *metadata_cache.lock().await;
                     let mut real_oids = HashMap::new();
 
-                    for ((schema, lookup_type_name), (fake_oid, fake_array_oid)) in
-                    unresolved_types
+                    for ((schema, lookup_type_name), (fake_oid, fake_array_oid)) in unresolved_types
                     {
                         // for each unresolved item
                         // we check whether it's arleady in the cache
@@ -444,21 +436,24 @@ impl AsyncPgConnection {
                             schema.as_deref().map(Into::into),
                             lookup_type_name.into(),
                         );
-                        let real_metadata = if let Some(type_metadata) =
-                            metadata_cache.lookup_type(&cache_key)
-                        {
-                            type_metadata
-                        } else {
-                            let type_metadata =
-                                lookup_type(schema.clone(), lookup_type_name.clone(), &raw_connection)
-                                    .await?;
-                            metadata_cache.store_type(cache_key, type_metadata);
+                        let real_metadata =
+                            if let Some(type_metadata) = metadata_cache.lookup_type(&cache_key) {
+                                type_metadata
+                            } else {
+                                let type_metadata = lookup_type(
+                                    schema.clone(),
+                                    lookup_type_name.clone(),
+                                    &raw_connection,
+                                )
+                                .await?;
+                                metadata_cache.store_type(cache_key, type_metadata);
 
-                            PgTypeMetadata::from_result(Ok(type_metadata))
-                        };
+                                PgTypeMetadata::from_result(Ok(type_metadata))
+                            };
                         // let (fake_oid, fake_array_oid) = metadata_lookup.fake_oids(index);
                         let (real_oid, real_array_oid) = unwrap_oids(&real_metadata);
-                        real_oids.extend([(*fake_oid, real_oid), (*fake_array_oid, real_array_oid)]);
+                        real_oids
+                            .extend([(*fake_oid, real_oid), (*fake_array_oid, real_array_oid)]);
                     }
 
                     // Replace fake OIDs with real OIDs in `bind_collector.metadata`
@@ -466,7 +461,7 @@ impl AsyncPgConnection {
                         let (oid, array_oid) = unwrap_oids(m);
                         *m = PgTypeMetadata::new(
                             real_oids.get(&oid).copied().unwrap_or(oid),
-                            real_oids.get(&array_oid).copied().unwrap_or(array_oid)
+                            real_oids.get(&array_oid).copied().unwrap_or(array_oid),
                         );
                     }
                     // Replace fake OIDs with real OIDs in `bind_collector.binds`
@@ -486,21 +481,18 @@ impl AsyncPgConnection {
                         bind_types: bind_collector.metadata.clone(),
                     },
                 };
-                let stmt = {
-                    let mut stmt_cache = stmt_cache.lock().await;
-                    stmt_cache
-                        .cached_prepared_statement(
-                            key,
-                            sql.clone(),
-                            is_safe_to_cache_prepared,
-                            &bind_collector.metadata,
-                            raw_connection.clone(),
-                            &instrumentation
-                        )
-                        .await?
-                        .0
-                        .clone()
-                };
+                let stmt = stmt_cache
+                    .lock()
+                    .await
+                    .cached_prepared_statement(
+                        key,
+                        sql.clone(),
+                        is_safe_to_cache_prepared,
+                        &bind_collector.metadata,
+                        &raw_connection,
+                        &instrumentation,
+                    )
+                    .await?;
 
                 let binds = bind_collector
                     .metadata
@@ -508,11 +500,12 @@ impl AsyncPgConnection {
                     .zip(bind_collector.binds)
                     .map(|(meta, bind)| ToSqlHelper(meta, bind))
                     .collect();
-                callback(raw_connection, stmt, binds).await
+                match callback(raw_connection, stmt, binds).await {
+                    Ok(res) => Ok(res),
+                    Err(e) => Err(error_joiner.join(e).await),
+                }
             };
-            let res = res.await;
-            let mut tm = tm.lock().await;
-            let r = update_transaction_manager_status(res, &mut tm);
+            let r = update_transaction_manager_status(res.await, &mut *tm.lock().await);
             instrumentation
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -520,10 +513,8 @@ impl AsyncPgConnection {
                     &StrQueryHelper::new(&sql),
                     r.as_ref().err(),
                 ));
-
             r
-        }
-            .boxed()
+        })
     }
 
     fn record_instrumentation(&self, event: InstrumentationEvent<'_>) {
@@ -531,6 +522,30 @@ impl AsyncPgConnection {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .on_connection_event(event);
+    }
+}
+
+/// transform xitca_postgres::Error to diesel::result::Error on certain condition.
+trait JoinError: Sized {
+    fn join(self, e: xitca_postgres::Error) -> BoxFuture<'static, Error>;
+}
+
+impl JoinError for Option<broadcast::Receiver<Arc<xitca_postgres::Error>>> {
+    #[cold]
+    #[inline(never)]
+    fn join(self, e: xitca_postgres::Error) -> BoxFuture<'static, Error> {
+        Box::pin(async {
+            // when xitca_postgres emit driver shutdown error it means it's Driver
+            // task has shutdown already. in this case just await for the driver error
+            // to showup and replace client's error type.
+            if e.is_driver_down() {
+                if let Some(mut rx) = self {
+                    let e = rx.recv().await.unwrap();
+                    return error_helper::from_tokio_postgres_error(e);
+                }
+            }
+            ErrorHelper(e).into()
+        })
     }
 }
 
@@ -712,7 +727,7 @@ LIMIT 1";
 async fn lookup_type(
     schema: Option<String>,
     type_name: String,
-    raw_connection: &xitca_postgres::Client,
+    raw_connection: &Client,
 ) -> QueryResult<(u32, u32)> {
     use xitca_postgres::AsyncLendingIterator;
     match schema {
@@ -770,29 +785,6 @@ fn replace_fake_oid(
         .get(&u32::from_be_bytes(*serialized_oid))?
         .to_be_bytes();
     Some(())
-}
-
-async fn drive_future<R>(
-    connection_future: Option<broadcast::Receiver<Arc<xitca_postgres::Error>>>,
-    client_future: impl Future<Output = Result<R, diesel::result::Error>>,
-) -> Result<R, diesel::result::Error> {
-    if let Some(mut connection_future) = connection_future {
-        let client_future = std::pin::pin!(client_future);
-        let connection_future = std::pin::pin!(connection_future.recv());
-        match futures_util::future::select(client_future, connection_future).await {
-            Either::Left((res, _)) => res,
-            // we got an error from the background task
-            // return it to the user
-            Either::Right((Ok(e), _)) => Err(self::error_helper::from_tokio_postgres_error(e)),
-            // seems like the background thread died for whatever reason
-            Either::Right((Err(e), _)) => Err(diesel::result::Error::DatabaseError(
-                DatabaseErrorKind::UnableToSendCommand,
-                Box::new(e.to_string()),
-            )),
-        }
-    } else {
-        client_future.await
-    }
 }
 
 impl PoolableConnection for AsyncPgConnection {

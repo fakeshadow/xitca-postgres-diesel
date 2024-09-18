@@ -96,7 +96,7 @@ impl<'a> FromSql<'a> for DieselFromSqlWrapper<'a> {
         Ok(DieselFromSqlWrapper(Some(PgValue::new(raw, ty))))
     }
 
-    fn from_sql_null(_ty: &Type) -> Result<Self, Box<dyn error::Error + Sync + Send>> {
+    fn from_sql_null(_: &Type) -> Result<Self, Box<dyn error::Error + Sync + Send>> {
         Ok(DieselFromSqlWrapper(None))
     }
 
