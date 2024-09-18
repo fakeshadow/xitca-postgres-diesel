@@ -7,7 +7,7 @@ use diesel::result::Error;
 use futures_core::stream::Stream;
 use xitca_postgres::compat::RowStreamOwned;
 
-use crate::{error_helper::ErrorHelper, row::PgRow};
+use crate::{error, row::PgRow};
 
 pub struct RowStream {
     stream: RowStreamOwned,
@@ -28,6 +28,6 @@ impl Stream for RowStream {
         Pin::new(&mut self.get_mut().stream)
             .poll_next(cx)
             .map_ok(PgRow::new)
-            .map_err(|e| Error::from(ErrorHelper(e)))
+            .map_err(error::into_error)
     }
 }

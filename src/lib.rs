@@ -1,7 +1,7 @@
 //! diesel-async api powered by xitca-postgres db driver
 
 mod cache;
-mod error_helper;
+mod error;
 mod row;
 mod serialize;
 mod stream;
@@ -31,21 +31,23 @@ use diesel::{
     result::{ConnectionError, ConnectionResult, DatabaseErrorKind, Error, QueryResult},
 };
 use diesel_async::{pooled_connection::PoolableConnection, AsyncConnection, SimpleAsyncConnection};
-use stream::RowStream;
-use tokio::{sync::Mutex, task::JoinHandle};
+use tokio::sync::Mutex;
 use xitca_postgres::{compat::StatementGuarded, types::Type, Client};
 
-use cache::{PrepareCallback, StmtCache};
-use error_helper::ErrorHelper;
-use row::PgRow;
-use serialize::ToSqlHelper;
-use transaction_manager::AnsiTransactionManager;
+use self::{
+    cache::{PrepareCallback, StmtCache},
+    error::ErrorJoiner,
+    row::PgRow,
+    serialize::ToSqlHelper,
+    stream::RowStream,
+    transaction_manager::AnsiTransactionManager,
+};
 
 pub use transaction_builder::TransactionBuilder;
 
 const FAKE_OID: u32 = 0;
 
-pub(crate) type Statement = StatementGuarded<Arc<Client>>;
+type Statement = StatementGuarded<Arc<Client>>;
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -142,7 +144,7 @@ impl AsyncConnection for AsyncPgConnection {
             let (client, driver) = xitca_postgres::Postgres::new(database_url)
                 .connect()
                 .await
-                .map_err(ErrorHelper)?;
+                .map_err(error::into_connection_error)?;
 
             let handle = tokio::spawn(async move {
                 driver
@@ -250,7 +252,7 @@ impl PrepareCallback for Arc<Client> {
 
         let stmt = Client::prepare(self, sql, &bind_types)
             .await
-            .map_err(ErrorHelper)?
+            .map_err(error::into_error)?
             .leak();
         Ok(StatementGuarded::new(stmt, self.clone()))
     }
@@ -521,52 +523,6 @@ impl AsyncPgConnection {
     }
 }
 
-/// transform xitca_postgres::Error to diesel::result::Error on certain condition.
-#[derive(Clone)]
-struct ErrorJoiner {
-    handle: Option<Arc<Mutex<JoinerInner>>>,
-}
-
-enum JoinerInner {
-    Handle(JoinHandle<xitca_postgres::Error>),
-    Error(xitca_postgres::Error),
-}
-
-impl ErrorJoiner {
-    fn new(handle: Option<JoinHandle<xitca_postgres::Error>>) -> Self {
-        Self {
-            handle: handle.map(|handle| Arc::new(Mutex::new(JoinerInner::Handle(handle)))),
-        }
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn join(&self, e: xitca_postgres::Error) -> BoxFuture<'_, Error> {
-        Box::pin(async move {
-            // when xitca_postgres emit driver shutdown error it means it's Driver
-            // task has shutdown already. in this case just await for the driver error
-            // to show up from join handle and replace client's error type.
-            if e.is_driver_down() {
-                if let Some(ref inner) = self.handle {
-                    let mut inner = inner.lock().await;
-                    return match *inner {
-                        JoinerInner::Error(ref e) => error_helper::from_tokio_postgres_error(e),
-                        JoinerInner::Handle(ref mut handle) => {
-                            let err = Box::pin(handle)
-                                .await
-                                .expect("Driver's task must not panic");
-                            let e = error_helper::from_tokio_postgres_error(&err);
-                            let _ = core::mem::replace(&mut *inner, JoinerInner::Error(err));
-                            e
-                        }
-                    };
-                }
-            }
-            error_helper::from_tokio_postgres_error(&e)
-        })
-    }
-}
-
 struct BindData {
     collect_bind_result: Result<(), Error>,
     fake_oid_locations: Vec<(usize, usize)>,
@@ -753,13 +709,13 @@ async fn lookup_type(
             let stmt = raw_connection
                 .prepare(LOOK_UP, &[])
                 .await
-                .map_err(ErrorHelper)?;
+                .map_err(error::into_error)?;
             raw_connection
                 .query(&stmt, &[&type_name, schema])
-                .map_err(ErrorHelper)?
+                .map_err(error::into_error)?
                 .try_next()
                 .await
-                .map_err(ErrorHelper)?
+                .map_err(error::into_error)?
                 .ok_or_else(|| Error::NotFound)
                 .map(|r| (r.get(0), r.get(1)))
         }
@@ -767,13 +723,13 @@ async fn lookup_type(
             let stmt = raw_connection
                 .prepare(LOOK_UP_NO_SCHEMA, &[])
                 .await
-                .map_err(ErrorHelper)?;
+                .map_err(error::into_error)?;
             raw_connection
                 .query(&stmt, &[&type_name])
-                .map_err(ErrorHelper)?
+                .map_err(error::into_error)?
                 .try_next()
                 .await
-                .map_err(ErrorHelper)?
+                .map_err(error::into_error)?
                 .ok_or_else(|| Error::NotFound)
                 .map(|r| (r.get(0), r.get(1)))
         }
