@@ -64,7 +64,7 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// [xitca-postgres]: https://github.com/HFQR/xitca-web/postgres
 ///
 /// ```rust
-/// # include!("../doctest_setup.rs");
+/// # include!("./doc_test.rs");
 /// use diesel_async::RunQueryDsl;
 ///
 /// #
@@ -222,7 +222,7 @@ async fn load_prepared(
     stmt: Statement,
     binds: Vec<ToSqlHelper>,
 ) -> Result<RowStream, xitca_postgres::Error> {
-    conn.query_raw(stmt.as_ref(), binds).map(RowStream::from)
+    conn.query_raw(&stmt, binds).map(RowStream::from)
 }
 
 async fn execute_prepared(
@@ -286,7 +286,7 @@ impl AsyncPgConnection {
     /// [`TransactionBuilder`]: crate::pg::TransactionBuilder
     ///
     /// ```rust
-    /// # include!("../doctest_setup.rs");
+    /// # include!("./doc_test.rs");
     /// # use scoped_futures::ScopedFutureExt;
     /// #
     /// # #[tokio::main(flavor = "current_thread")]
@@ -357,7 +357,7 @@ impl AsyncPgConnection {
     fn with_prepared_statement<'a, T, F, R>(
         &mut self,
         query: T,
-        callback: fn(Arc<Client>, Statement, Vec<ToSqlHelper>) -> F,
+        callback: impl FnOnce(Arc<Client>, Statement, Vec<ToSqlHelper>) -> F + Send + 'static,
     ) -> BoxFuture<'a, QueryResult<R>>
     where
         T: QueryFragment<Pg> + QueryId,
@@ -391,7 +391,7 @@ impl AsyncPgConnection {
 
     fn with_prepared_statement_after_sql_built<'a, F, R>(
         &mut self,
-        callback: fn(Arc<Client>, Statement, Vec<ToSqlHelper>) -> F,
+        callback: impl FnOnce(Arc<Client>, Statement, Vec<ToSqlHelper>) -> F + Send + 'static,
         is_safe_to_cache_prepared: QueryResult<bool>,
         query_id: Option<std::any::TypeId>,
         to_sql_result: QueryResult<()>,
