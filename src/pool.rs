@@ -135,9 +135,22 @@ mod test {
         let mut conn = pool.get().await.unwrap();
 
         diesel::sql_query("SELECT 1")
+            .execute(&mut &*conn)
+            .await
+            .unwrap();
+
+        diesel::sql_query("SELECT 1")
             .execute(&mut conn)
             .await
             .unwrap();
+
+        let task = {
+            let task = diesel::sql_query("SELECT 1").execute(&mut conn);
+            drop(conn);
+            task
+        };
+
+        task.await.unwrap();
     }
 
     #[tokio::test]

@@ -75,8 +75,7 @@ impl<'a> Field<'a, Pg> for PgField<'a> {
     }
 
     fn value(&self) -> Option<<Pg as Backend>::RawValue<'_>> {
-        let DieselFromSqlWrapper(value) = self.row.get_raw(self.idx);
-        value
+        self.row.get::<DieselFromSqlWrapper>(self.idx).0
     }
 }
 

@@ -34,7 +34,7 @@ impl StmtCache {
     pub async fn cached_prepared_statement(
         &mut self,
         cache_key: StatementCacheKey<Pg>,
-        sql: String,
+        sql: &str,
         is_query_safe_to_cache: bool,
         metadata: &[PgTypeMetadata],
         prepare_fn: &Arc<Client>,
@@ -44,7 +44,7 @@ impl StmtCache {
 
         if !is_query_safe_to_cache {
             let metadata = metadata.to_vec();
-            return Box::pin(prepare_fn.prepare(&sql, &metadata)).await;
+            return Box::pin(prepare_fn.prepare(sql, &metadata)).await;
         }
 
         match self.cache.entry(cache_key) {
@@ -54,9 +54,9 @@ impl StmtCache {
                 instrumentation
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .on_connection_event(InstrumentationEvent::cache_query(&sql));
+                    .on_connection_event(InstrumentationEvent::cache_query(sql));
                 Box::pin(async move {
-                    prepare_fn.prepare(&sql, &metadata).await.inspect(|stmt| {
+                    prepare_fn.prepare(sql, &metadata).await.inspect(|stmt| {
                         entry.insert(stmt.clone());
                     })
                 })
