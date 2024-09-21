@@ -1,4 +1,4 @@
-use core::future::Future;
+use core::{any::TypeId, future::Future};
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -33,35 +33,52 @@ impl StmtCache {
 
     pub async fn cached_prepared_statement(
         &mut self,
-        cache_key: StatementCacheKey<Pg>,
-        sql: &str,
+        query_id: Option<TypeId>,
+        sql: String,
         is_query_safe_to_cache: bool,
         metadata: &[PgTypeMetadata],
         prepare_fn: &Arc<Client>,
-        instrumentation: &std::sync::Mutex<Option<Box<dyn Instrumentation>>>,
+        instrumentation: &std::sync::Mutex<dyn Instrumentation>,
     ) -> QueryResult<Statement> {
-        use std::collections::hash_map::Entry::{Occupied, Vacant};
-
         if !is_query_safe_to_cache {
-            let metadata = metadata.to_vec();
-            return Box::pin(prepare_fn.prepare(sql, &metadata)).await;
+            return Box::pin(prepare_fn.prepare(&sql, metadata)).await;
         }
 
-        match self.cache.entry(cache_key) {
-            Occupied(entry) => Ok(entry.into_mut().clone()),
-            Vacant(entry) => {
-                let metadata = metadata.to_vec();
-                instrumentation
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .on_connection_event(InstrumentationEvent::cache_query(sql));
-                Box::pin(async move {
-                    prepare_fn.prepare(sql, &metadata).await.inspect(|stmt| {
-                        entry.insert(stmt.clone());
-                    })
-                })
-                .await
-            }
+        let (cache_key, opt) = match query_id {
+            Some(id) => (StatementCacheKey::Type(id), Some((sql, metadata))),
+            None => (
+                StatementCacheKey::Sql {
+                    sql,
+                    bind_types: metadata.to_owned(),
+                },
+                None,
+            ),
+        };
+
+        if let Some(stmt) = self.cache.get(&cache_key) {
+            return Ok(stmt.clone());
         }
+
+        Box::pin(async move {
+            let (sql, meta) = match cache_key {
+                StatementCacheKey::Type(ref _id) => {
+                    opt.as_ref().map(|(sql, meta)| (sql, *meta)).unwrap()
+                }
+                StatementCacheKey::Sql {
+                    ref sql,
+                    ref bind_types,
+                } => (sql, &**bind_types),
+            };
+
+            instrumentation
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .on_connection_event(InstrumentationEvent::cache_query(sql));
+
+            let stmt = prepare_fn.prepare(sql, meta).await?;
+            self.cache.insert(cache_key, stmt.clone());
+            Ok(stmt)
+        })
+        .await
     }
 }

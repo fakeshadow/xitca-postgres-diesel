@@ -25,9 +25,7 @@ use std::{
 };
 
 use diesel::{
-    connection::{
-        statement_cache::StatementCacheKey, Instrumentation, InstrumentationEvent, StrQueryHelper,
-    },
+    connection::{Instrumentation, InstrumentationEvent, StrQueryHelper},
     pg::{
         Pg, PgMetadataCache, PgMetadataCacheKey, PgMetadataLookup, PgQueryBuilder, PgTypeMetadata,
     },
@@ -99,11 +97,10 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub struct AsyncPgConnection {
     conn: Arc<Client>,
     stmt_cache: Arc<Mutex<StmtCache>>,
-    transaction_state: Arc<Mutex<AnsiTransactionManager>>,
     metadata_cache: Arc<Mutex<PgMetadataCache>>,
     error_joiner: ErrorJoiner,
     // a sync mutex is fine here as we only hold it for a really short time
-    instrumentation: Arc<std::sync::Mutex<Option<Box<dyn Instrumentation>>>>,
+    instrumentation: Arc<std::sync::Mutex<dyn Instrumentation>>,
 }
 
 impl SimpleAsyncConnection for AsyncPgConnection {
@@ -144,7 +141,7 @@ impl AsyncConnection for AsyncPgConnection {
         instrumentation.on_connection_event(InstrumentationEvent::start_establish_connection(
             database_url,
         ));
-        let instrumentation = Arc::new(std::sync::Mutex::new(instrumentation));
+        let instrumentation = Arc::new(std::sync::Mutex::new(instrumentation)) as _;
         Box::pin(async move {
             let (client, driver) = xitca_postgres::Postgres::new(database_url)
                 .connect()
@@ -187,6 +184,7 @@ impl AsyncConnection for AsyncPgConnection {
         unimplemented!("transaction is temporary disabled")
     }
 
+    #[inline]
     fn load<'conn, 'query, T>(&'conn mut self, source: T) -> Self::LoadFuture<'conn, 'query>
     where
         T: AsQuery + 'query,
@@ -195,6 +193,7 @@ impl AsyncConnection for AsyncPgConnection {
         self.with_prepared_statement(source.as_query(), load_prepared)
     }
 
+    #[inline]
     fn execute_returning_count<'conn, 'query, T>(
         &'conn mut self,
         source: T,
@@ -206,12 +205,7 @@ impl AsyncConnection for AsyncPgConnection {
     }
 
     fn transaction_state(&mut self) -> &mut AnsiTransactionManager {
-        // there should be no other pending future when this is called
-        // that means there is only one instance of this arc and
-        // we can simply access the inner data
-        Arc::get_mut(&mut self.transaction_state)
-            .expect("Cannot access shared transaction state")
-            .get_mut()
+        unimplemented!("AsyncPgConnection does not contain transaction state")
     }
 
     fn instrumentation(&mut self) -> &mut dyn Instrumentation {
@@ -225,7 +219,7 @@ impl AsyncConnection for AsyncPgConnection {
     }
 
     fn set_instrumentation(&mut self, instrumentation: impl Instrumentation) {
-        self.instrumentation = Arc::new(std::sync::Mutex::new(Some(Box::new(instrumentation))));
+        self.instrumentation = Arc::new(std::sync::Mutex::new(instrumentation));
     }
 }
 
@@ -385,12 +379,11 @@ impl AsyncPgConnection {
     async fn setup(
         conn: Client,
         error_joiner: ErrorJoiner,
-        instrumentation: Arc<std::sync::Mutex<Option<Box<dyn Instrumentation>>>>,
+        instrumentation: Arc<std::sync::Mutex<dyn Instrumentation>>,
     ) -> ConnectionResult<Self> {
         let mut conn = Self {
             conn: Arc::new(conn),
             stmt_cache: Arc::new(Mutex::new(StmtCache::new())),
-            transaction_state: Arc::new(Mutex::new(AnsiTransactionManager::default())),
             metadata_cache: Arc::new(Mutex::new(PgMetadataCache::new())),
             error_joiner,
             instrumentation,
@@ -502,7 +495,7 @@ impl AsyncPgConnection {
                 // Check whether we need to resolve some types at all
                 //
                 // If the user doesn't use custom types there is no need
-                // to borther with that at all
+                // to bother with that at all
                 if let Some(ref unresolved_types) = generated_oids {
                     let metadata_cache = &mut *metadata_cache.lock().await;
                     let mut real_oids = HashMap::new();
@@ -510,7 +503,7 @@ impl AsyncPgConnection {
                     for ((schema, lookup_type_name), (fake_oid, fake_array_oid)) in unresolved_types
                     {
                         // for each unresolved item
-                        // we check whether it's arleady in the cache
+                        // we check whether it's already in the cache
                         // or perform a lookup and insert it into the cache
                         let cache_key = PgMetadataCacheKey::new(
                             schema.as_deref().map(Into::into),
@@ -554,19 +547,13 @@ impl AsyncPgConnection {
                             })?;
                     }
                 }
-                let key = match query_id {
-                    Some(id) => StatementCacheKey::Type(id),
-                    None => StatementCacheKey::Sql {
-                        sql: sql.clone(),
-                        bind_types: bind_collector.metadata.clone(),
-                    },
-                };
+
                 let stmt = stmt_cache
                     .lock()
                     .await
                     .cached_prepared_statement(
-                        key,
-                        &sql,
+                        query_id,
+                        sql.clone(),
                         is_safe_to_cache_prepared,
                         &bind_collector.metadata,
                         &raw_connection,
@@ -617,7 +604,7 @@ fn construct_bind_data(query: &dyn QueryFragment<Pg>) -> BindData {
     // queries for that.
     //
     // We apply this workaround to prevent requiring all the diesel
-    // serialization code to beeing async
+    // serialization code to being async
     //
     // We give out constant fake oids here to optimize for the "happy" path
     // without custom type lookup
@@ -630,10 +617,10 @@ fn construct_bind_data(query: &dyn QueryFragment<Pg>) -> BindData {
     let collect_bind_result_0 =
         query.collect_binds(&mut bind_collector_0, &mut metadata_lookup_0, &Pg);
     // we have encountered a custom type oid, so we need to perform more work here.
-    // These oids can occure in two locations:
+    // These oids can occur in two locations:
     //
-    // * In the collected metadata -> relativly easy to resolve, just need to replace them below
-    // * As part of the seralized bind blob -> hard to replace
+    // * In the collected metadata -> relatively easy to resolve, just need to replace them below
+    // * As part of the serialized bind blob -> hard to replace
     //
     // To address the second case, we perform a second run of the bind collector
     // with a different set of fake oids. Then we compare the output of the two runs
@@ -669,6 +656,7 @@ fn construct_bind_data(query: &dyn QueryFragment<Pg>) -> BindData {
             bind_collector_0.binds.len(),
             bind_collector_0.metadata.len()
         );
+
         let fake_oid_locations = std::iter::zip(
             bind_collector_0
                 .binds
@@ -757,7 +745,7 @@ where
     fn lookup_type(&mut self, type_name: &str, schema: Option<&str>) -> PgTypeMetadata {
         self.custom_oid = true;
 
-        let oid = if let Some(map) = &mut self.generated_oids {
+        let oid = if let Some(ref mut map) = self.generated_oids {
             *map.entry((schema.map(ToOwned::to_owned), type_name.to_owned()))
                 .or_insert_with(|| (self.oid_generator)(type_name, schema))
         } else {
