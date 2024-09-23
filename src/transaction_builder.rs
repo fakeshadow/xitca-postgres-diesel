@@ -2,7 +2,7 @@ use diesel::backend::Backend;
 use diesel::pg::Pg;
 use diesel::query_builder::{AstPass, QueryBuilder, QueryFragment};
 use diesel::QueryResult;
-use diesel_async::{AsyncConnection, TransactionManager};
+use diesel_async::{AsyncTransaction, TransactionManager};
 use scoped_futures::ScopedBoxFuture;
 
 use crate::transaction_manager::AnsiTransactionManager;
@@ -26,7 +26,7 @@ pub struct TransactionBuilder<'a, C> {
 
 impl<'a, C> TransactionBuilder<'a, C>
 where
-    C: AsyncConnection<Backend = Pg, TransactionManager = AnsiTransactionManager>,
+    C: AsyncTransaction<Backend = Pg, TransactionManager = AnsiTransactionManager>,
 {
     pub(crate) fn new(connection: &'a mut C) -> Self {
         Self {
@@ -380,6 +380,8 @@ impl QueryFragment<Pg> for Deferrable {
 
 #[cfg(test)]
 mod tests {
+    use diesel_async::AsyncEstablish;
+
     use super::*;
 
     #[tokio::test]

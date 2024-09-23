@@ -3,6 +3,7 @@ use diesel::prelude::{
     AsChangeset, ExpressionMethods, Identifiable, IntoSql, QueryDsl, QueryResult, Queryable,
     QueryableByName,
 };
+use diesel_async::{AsyncConnection, AsyncEstablish, AsyncTransaction};
 
 use xitca_postgres_diesel::AsyncPgConnection;
 #[allow(dead_code)]
@@ -15,13 +16,11 @@ fn database_url() -> String {
 }
 
 async fn connection_no_transaction() -> AsyncPgConnection {
-    use diesel_async::AsyncConnection;
     let connection_url = database_url();
     AsyncPgConnection::establish(&connection_url).await.unwrap()
 }
 
 async fn connection_no_data() -> AsyncPgConnection {
-    use diesel_async::AsyncConnection;
     let mut connection = connection_no_transaction().await;
     connection.begin_test_transaction().await.unwrap();
     connection

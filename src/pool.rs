@@ -14,7 +14,7 @@ use std::{
 };
 
 use diesel::ConnectionError;
-use diesel_async::pooled_connection::PoolableConnection;
+use diesel_async::{pooled_connection::PoolableConnection, AsyncEstablish};
 use tokio::{
     runtime::Handle,
     sync::{oneshot, Semaphore, SemaphorePermit},
@@ -82,7 +82,7 @@ pub struct Pool<C> {
 
 impl<C> Pool<C>
 where
-    C: PoolableConnection + 'static,
+    C: PoolableConnection + AsyncEstablish + 'static,
 {
     pub fn builder() -> PoolBuilder<C> {
         PoolBuilder::default()
@@ -159,12 +159,14 @@ where
 mod test {
     use diesel_async::{
         pooled_connection::{bb8, AsyncDieselConnectionManager},
-        RunQueryDsl,
+        AsyncTransaction, RunQueryDsl,
     };
+
+    use crate::AsyncPgConnection;
 
     #[tokio::test]
     async fn bb8() {
-        let pool = bb8::Pool::<crate::AsyncPgConnection>::builder()
+        let pool = bb8::Pool::<AsyncPgConnection>::builder()
             .build(AsyncDieselConnectionManager::new(
                 "postgres://postgres:postgres@localhost:5432/postgres",
             ))
@@ -173,13 +175,20 @@ mod test {
 
         let mut conn = pool.get().await.unwrap();
 
-        diesel::sql_query("SELECT 1")
-            .execute(&mut &*conn)
-            .await
-            .unwrap();
+        async fn query(mut conn: &AsyncPgConnection) {
+            diesel::sql_query("SELECT 1")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
 
-        diesel::sql_query("SELECT 1")
-            .execute(&mut conn)
+        let q1 = query(&*conn);
+        let q2 = query(&*conn);
+
+        q1.await;
+        q2.await;
+
+        conn.transaction(|_| Box::pin(async { Ok::<_, diesel::result::Error>(()) }))
             .await
             .unwrap();
 

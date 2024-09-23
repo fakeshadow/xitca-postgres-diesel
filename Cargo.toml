@@ -18,4 +18,4 @@ futures-util = "0.3"
 tokio = { version = "1.40.0", features = ["macros", "rt"] }
 
 [patch.crates-io]
-diesel-async = { git = "https://github.com/weiznich/diesel_async", rev = "5b8262b" }
+diesel-async = { git = "https://github.com/fakeshadow/diesel_async", branch = "split_trait" }

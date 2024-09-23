@@ -34,7 +34,10 @@ use diesel::{
     },
     result::{ConnectionError, ConnectionResult, Error, QueryResult},
 };
-use diesel_async::{pooled_connection::PoolableConnection, AsyncConnection, SimpleAsyncConnection};
+use diesel_async::{
+    pooled_connection::PoolableConnection, AsyncConnection, AsyncEstablish, AsyncTransaction,
+    SimpleAsyncConnection,
+};
 use scoped_futures::ScopedBoxFuture;
 use tokio::sync::Mutex;
 use xitca_postgres::{compat::StatementGuarded, types::Type, Client};
@@ -125,64 +128,67 @@ impl SimpleAsyncConnection for &AsyncPgConnection {
     }
 }
 
+impl AsyncEstablish for AsyncPgConnection {
+    async fn establish(database_url: &str) -> ConnectionResult<Self> {
+        let mut instrumentation = diesel::connection::get_default_instrumentation();
+        instrumentation.on_connection_event(InstrumentationEvent::start_establish_connection(
+            database_url,
+        ));
+        let instrumentation = Arc::new(std::sync::Mutex::new(instrumentation)) as _;
+        let (client, driver) = xitca_postgres::Postgres::new(database_url)
+            .connect()
+            .await
+            .map_err(error::into_connection_error)?;
+
+        let handle = tokio::spawn(async move {
+            driver
+                .into_future()
+                .await
+                // TODO: diesel async should be treat driver graceful shutdown as non error.
+                .err()
+                .unwrap_or_else(|| xitca_postgres::error::DriverDown.into())
+        });
+
+        let r = Self::setup(
+            client,
+            ErrorJoiner::new(Some(handle)),
+            Arc::clone(&instrumentation),
+        )
+        .await;
+        instrumentation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .on_connection_event(InstrumentationEvent::finish_establish_connection(
+                database_url,
+                r.as_ref().err(),
+            ));
+        r
+    }
+}
+
+impl AsyncTransaction for AsyncPgConnection {
+    type TransactionManager = AnsiTransactionManager;
+
+    async fn transaction<'a, R, E, F>(&mut self, _: F) -> Result<R, E>
+    where
+        F: for<'r> FnOnce(&'r mut Self) -> ScopedBoxFuture<'a, 'r, Result<R, E>> + Send + 'a,
+        E: From<diesel::result::Error> + Send + 'a,
+        R: Send + 'a,
+    {
+        unimplemented!("transaction is temporary disabled")
+    }
+
+    fn transaction_state(&mut self) -> &mut AnsiTransactionManager {
+        unimplemented!("AsyncPgConnection does not contain transaction state")
+    }
+}
+
 impl AsyncConnection for AsyncPgConnection {
     type ExecuteFuture<'conn, 'query> = BoxFuture<'query, QueryResult<usize>>;
     type LoadFuture<'conn, 'query> = BoxFuture<'query, QueryResult<Self::Stream<'conn, 'query>>>;
     type Stream<'conn, 'query> = RowStream;
     type Row<'conn, 'query> = PgRow;
     type Backend = Pg;
-    type TransactionManager = AnsiTransactionManager;
-
-    fn establish<'d, 'f>(database_url: &'d str) -> BoxFuture<'f, ConnectionResult<Self>>
-    where
-        'd: 'f,
-    {
-        let mut instrumentation = diesel::connection::get_default_instrumentation();
-        instrumentation.on_connection_event(InstrumentationEvent::start_establish_connection(
-            database_url,
-        ));
-        let instrumentation = Arc::new(std::sync::Mutex::new(instrumentation)) as _;
-        Box::pin(async move {
-            let (client, driver) = xitca_postgres::Postgres::new(database_url)
-                .connect()
-                .await
-                .map_err(error::into_connection_error)?;
-
-            let handle = tokio::spawn(async move {
-                driver
-                    .into_future()
-                    .await
-                    // TODO: diesel async should be treat driver graceful shutdown as non error.
-                    .err()
-                    .unwrap_or_else(|| xitca_postgres::error::DriverDown.into())
-            });
-
-            let r = Self::setup(
-                client,
-                ErrorJoiner::new(Some(handle)),
-                Arc::clone(&instrumentation),
-            )
-            .await;
-            instrumentation
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .on_connection_event(InstrumentationEvent::finish_establish_connection(
-                    database_url,
-                    r.as_ref().err(),
-                ));
-            r
-        })
-    }
-
-    fn transaction<'a, 's, 'f, R, E, F>(&'s mut self, _: F) -> BoxFuture<'f, Result<R, E>>
-    where
-        F: for<'r> FnOnce(&'r mut Self) -> ScopedBoxFuture<'a, 'r, Result<R, E>> + Send + 'a,
-        E: From<diesel::result::Error> + Send + 'a,
-        R: Send + 'a,
-        's: 'f,
-    {
-        unimplemented!("transaction is temporary disabled")
-    }
 
     #[inline]
     fn load<'conn, 'query, T>(&'conn mut self, source: T) -> Self::LoadFuture<'conn, 'query>
@@ -202,10 +208,6 @@ impl AsyncConnection for AsyncPgConnection {
         T: QueryFragment<Self::Backend> + QueryId + 'query,
     {
         self.with_prepared_statement(source, execute_prepared)
-    }
-
-    fn transaction_state(&mut self) -> &mut AnsiTransactionManager {
-        unimplemented!("AsyncPgConnection does not contain transaction state")
     }
 
     fn instrumentation(&mut self) -> &mut dyn Instrumentation {
@@ -231,24 +233,6 @@ impl AsyncConnection for &AsyncPgConnection {
     type Stream<'conn, 'query> = <AsyncPgConnection as AsyncConnection>::Stream<'conn, 'query>;
     type Row<'conn, 'query> = <AsyncPgConnection as AsyncConnection>::Row<'conn, 'query>;
     type Backend = <AsyncPgConnection as AsyncConnection>::Backend;
-    type TransactionManager = <AsyncPgConnection as AsyncConnection>::TransactionManager;
-
-    fn establish<'d, 'f>(_: &'d str) -> BoxFuture<'f, ConnectionResult<Self>>
-    where
-        'd: 'f,
-    {
-        unimplemented!("&AsyncPgConnection can't be used to construct a new connection")
-    }
-
-    fn transaction<'a, 's, 'f, R, E, F>(&'s mut self, _: F) -> BoxFuture<'f, Result<R, E>>
-    where
-        F: for<'r> FnOnce(&'r mut Self) -> ScopedBoxFuture<'a, 'r, Result<R, E>> + Send + 'a,
-        E: From<diesel::result::Error> + Send + 'a,
-        R: Send + 'a,
-        's: 'f,
-    {
-        unimplemented!("&AsyncPgConnection can't be used for transaction")
-    }
 
     fn load<'conn, 'query, T>(&'conn mut self, source: T) -> Self::LoadFuture<'conn, 'query>
     where
@@ -266,10 +250,6 @@ impl AsyncConnection for &AsyncPgConnection {
         T: QueryFragment<Self::Backend> + QueryId + 'query,
     {
         self.with_prepared_statement(source, execute_prepared)
-    }
-
-    fn transaction_state(&mut self) -> &mut AnsiTransactionManager {
-        unimplemented!("&AsyncPgConnection can't be used for transaction")
     }
 
     fn instrumentation(&mut self) -> &mut dyn Instrumentation {
