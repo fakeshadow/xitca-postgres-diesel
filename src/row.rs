@@ -8,7 +8,7 @@ use diesel::{
     row::{Field, PartialRow, Row, RowIndex, RowSealed},
 };
 use xitca_postgres::{
-    compat::RowOwned,
+    row::RowOwned,
     types::{FromSql, Type},
 };
 
@@ -24,7 +24,11 @@ impl PgRow {
 impl RowSealed for PgRow {}
 
 impl<'a> Row<'a, Pg> for PgRow {
-    type Field<'b> = PgField<'b> where Self: 'b, 'a: 'b;
+    type Field<'b>
+        = PgField<'b>
+    where
+        Self: 'b,
+        'a: 'b;
     type InnerPartialRow = Self;
 
     fn field_count(&self) -> usize {

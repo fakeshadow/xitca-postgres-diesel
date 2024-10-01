@@ -5,7 +5,7 @@ use core::{
 
 use diesel::result::Error;
 use futures_core::stream::Stream;
-use xitca_postgres::compat::RowStreamOwned;
+use xitca_postgres::RowStreamOwned;
 
 use crate::{error, row::PgRow};
 

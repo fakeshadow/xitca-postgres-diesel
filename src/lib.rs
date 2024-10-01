@@ -37,7 +37,9 @@ use diesel::{
 use diesel_async::{pooled_connection::PoolableConnection, AsyncConnection, SimpleAsyncConnection};
 use scoped_futures::ScopedBoxFuture;
 use tokio::sync::Mutex;
-use xitca_postgres::{compat::StatementGuarded, types::Type, Client};
+use xitca_postgres::{
+    compat::StatementGuarded, iter::AsyncLendingIterator, types::Type, Client, Execute,
+};
 
 use self::{
     cache::{PrepareCallback, StmtCache},
@@ -286,8 +288,10 @@ fn load_prepared(
     stmt: Statement,
     binds: Binds,
 ) -> impl Future<Output = Result<RowStream, xitca_postgres::Error>> + Send {
-    let res = conn
-        .query_raw(&stmt, binds.map(|(a, b)| ToSqlHelper(a, b)))
+    let res = stmt
+        .bind(binds.map(|(a, b)| ToSqlHelper(a, b)))
+        .query(conn)
+        .into_inner()
         .map(RowStream::from);
     async { res }
 }
@@ -297,7 +301,9 @@ fn execute_prepared(
     stmt: Statement,
     binds: Binds,
 ) -> impl Future<Output = Result<usize, xitca_postgres::Error>> + Send {
-    let res = conn.execute_raw(&stmt, binds.map(|(a, b)| ToSqlHelper(a, b)));
+    let res = stmt
+        .bind(binds.map(|(a, b)| ToSqlHelper(a, b)))
+        .execute(conn);
     async { res.await.map(|n| n as _) }
 }
 
@@ -308,7 +314,8 @@ impl PrepareCallback for Arc<Client> {
             .map(type_from_oid)
             .collect::<QueryResult<Vec<_>>>()?;
 
-        let stmt = Client::prepare(self, sql, &bind_types)
+        let stmt = xitca_postgres::statement::Statement::named(sql, &bind_types)
+            .execute(self)
             .await
             .map_err(error::into_error)?
             .leak();
@@ -412,7 +419,7 @@ impl AsyncPgConnection {
         self.record_instrumentation(InstrumentationEvent::start_query(&StrQueryHelper::new(
             query,
         )));
-        let batch_execute = self.conn.execute_simple(query);
+        let batch_execute = query.execute(&self.conn);
 
         let res = match batch_execute.await {
             Ok(_) => Ok(()),
@@ -772,36 +779,33 @@ async fn lookup_type(
     type_name: String,
     raw_connection: &Client,
 ) -> QueryResult<(u32, u32)> {
-    use xitca_postgres::AsyncLendingIterator;
     match schema {
-        Some(ref schema) => {
-            let stmt = raw_connection
-                .prepare(LOOK_UP, &[])
-                .await
-                .map_err(error::into_error)?;
-            raw_connection
-                .query(&stmt, &[&type_name, schema])
-                .map_err(error::into_error)?
-                .try_next()
-                .await
-                .map_err(error::into_error)?
-                .ok_or_else(|| Error::NotFound)
-                .map(|r| (r.get(0), r.get(1)))
-        }
-        None => {
-            let stmt = raw_connection
-                .prepare(LOOK_UP_NO_SCHEMA, &[])
-                .await
-                .map_err(error::into_error)?;
-            raw_connection
-                .query(&stmt, &[&type_name])
-                .map_err(error::into_error)?
-                .try_next()
-                .await
-                .map_err(error::into_error)?
-                .ok_or_else(|| Error::NotFound)
-                .map(|r| (r.get(0), r.get(1)))
-        }
+        Some(ref schema) => xitca_postgres::statement::Statement::named(LOOK_UP, &[])
+            .execute(raw_connection)
+            .await
+            .map_err(error::into_error)?
+            .bind_dyn(&[&type_name, schema])
+            .query(raw_connection)
+            .await
+            .map_err(error::into_error)?
+            .try_next()
+            .await
+            .map_err(error::into_error)?
+            .ok_or_else(|| Error::NotFound)
+            .map(|r| (r.get(0), r.get(1))),
+        None => xitca_postgres::statement::Statement::named(LOOK_UP_NO_SCHEMA, &[])
+            .execute(raw_connection)
+            .await
+            .map_err(error::into_error)?
+            .bind([&type_name])
+            .query(raw_connection)
+            .await
+            .map_err(error::into_error)?
+            .try_next()
+            .await
+            .map_err(error::into_error)?
+            .ok_or_else(|| Error::NotFound)
+            .map(|r| (r.get(0), r.get(1))),
     }
 }
 
