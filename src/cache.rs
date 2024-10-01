@@ -7,21 +7,21 @@ use diesel::{
     pg::{Pg, PgTypeMetadata},
     result::QueryResult,
 };
-use xitca_postgres::Client;
+use xitca_postgres::{dev::Query, statement::StatementGuarded, Client};
 
-use crate::Statement;
+use crate::{EitherStatement, StatementShared};
 
 #[derive(Default)]
 pub struct StmtCache {
-    cache: HashMap<StatementCacheKey<Pg>, Statement>,
+    cache: HashMap<StatementCacheKey<Pg>, StatementShared>,
 }
 
-pub trait PrepareCallback {
-    fn prepare(
-        &self,
+pub trait PrepareCallback: Query + Sized {
+    fn prepare<'s>(
+        &'s self,
         sql: &str,
         metadata: &[PgTypeMetadata],
-    ) -> impl Future<Output = QueryResult<Statement>> + Send;
+    ) -> impl Future<Output = QueryResult<StatementGuarded<'s, Self>>> + Send;
 }
 
 impl StmtCache {
@@ -31,17 +31,19 @@ impl StmtCache {
         }
     }
 
-    pub async fn cached_prepared_statement(
+    pub async fn cached_prepared_statement<'c>(
         &mut self,
         query_id: Option<TypeId>,
         sql: String,
         is_query_safe_to_cache: bool,
         metadata: &[PgTypeMetadata],
-        prepare_fn: &Arc<Client>,
+        prepare_fn: &'c Arc<Client>,
         instrumentation: &std::sync::Mutex<dyn Instrumentation>,
-    ) -> QueryResult<Statement> {
+    ) -> QueryResult<EitherStatement<'c>> {
         if !is_query_safe_to_cache {
-            return Box::pin(prepare_fn.prepare(&sql, metadata)).await;
+            return Box::pin(prepare_fn.prepare(&sql, metadata))
+                .await
+                .map(EitherStatement::Onetime);
         }
 
         let (cache_key, opt) = match query_id {
@@ -56,7 +58,7 @@ impl StmtCache {
         };
 
         if let Some(stmt) = self.cache.get(&cache_key) {
-            return Ok(stmt.clone());
+            return Ok(EitherStatement::Cached(stmt.clone()));
         }
 
         Box::pin(async move {
@@ -75,9 +77,10 @@ impl StmtCache {
                 .unwrap_or_else(|p| p.into_inner())
                 .on_connection_event(InstrumentationEvent::cache_query(sql));
 
-            let stmt = prepare_fn.prepare(sql, meta).await?;
+            let stmt = prepare_fn.prepare(sql, meta).await?.leak();
+            let stmt = Arc::new(stmt);
             self.cache.insert(cache_key, stmt.clone());
-            Ok(stmt)
+            Ok(EitherStatement::Cached(stmt))
         })
         .await
     }

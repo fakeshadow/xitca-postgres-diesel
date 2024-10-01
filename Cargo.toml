@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 diesel = { version = "2", features = ["postgres"] }
 diesel-async = { version = "0.5", features = ["pool"] }
-xitca-postgres = { version = "0.2", features = ["compat"] }
+xitca-postgres = { version = "0.2.1", features = ["compat"] }
 
 futures-core = { version = "0.3", default-features = false }
 scoped-futures = "0.1.3"

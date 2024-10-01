@@ -38,7 +38,10 @@ use diesel_async::{pooled_connection::PoolableConnection, AsyncConnection, Simpl
 use scoped_futures::ScopedBoxFuture;
 use tokio::sync::Mutex;
 use xitca_postgres::{
-    compat::StatementGuarded, iter::AsyncLendingIterator, types::Type, Client, Execute,
+    iter::AsyncLendingIterator,
+    statement::{Statement, StatementGuarded, StatementUnnamed},
+    types::Type,
+    Client, Execute,
 };
 
 use self::{
@@ -54,7 +57,21 @@ pub use transaction_builder::TransactionBuilder;
 
 const FAKE_OID: u32 = 0;
 
-type Statement = StatementGuarded<Arc<Client>>;
+type StatementShared = Arc<Statement>;
+
+enum EitherStatement<'a> {
+    Onetime(StatementGuarded<'a, Arc<Client>>),
+    Cached(StatementShared),
+}
+
+impl EitherStatement<'_> {
+    fn statement_ref(&self) -> &Statement {
+        match self {
+            Self::Onetime(ref stmt) => stmt,
+            Self::Cached(ref stmt) => stmt,
+        }
+    }
+}
 
 type Binds = Zip<IntoIter<PgTypeMetadata>, IntoIter<Option<Vec<u8>>>>;
 
@@ -285,10 +302,11 @@ impl AsyncConnection for &AsyncPgConnection {
 
 fn load_prepared(
     conn: &Client,
-    stmt: Statement,
+    stmt: EitherStatement<'_>,
     binds: Binds,
 ) -> impl Future<Output = Result<RowStream, xitca_postgres::Error>> + Send {
     let res = stmt
+        .statement_ref()
         .bind(binds.map(|(a, b)| ToSqlHelper(a, b)))
         .query(conn)
         .into_inner()
@@ -298,28 +316,30 @@ fn load_prepared(
 
 fn execute_prepared(
     conn: &Client,
-    stmt: Statement,
+    stmt: EitherStatement<'_>,
     binds: Binds,
 ) -> impl Future<Output = Result<usize, xitca_postgres::Error>> + Send {
     let res = stmt
+        .statement_ref()
         .bind(binds.map(|(a, b)| ToSqlHelper(a, b)))
         .execute(conn);
     async { res.await.map(|n| n as _) }
 }
 
 impl PrepareCallback for Arc<Client> {
-    async fn prepare(&self, sql: &str, metadata: &[PgTypeMetadata]) -> QueryResult<Statement> {
+    async fn prepare<'s>(
+        &'s self,
+        sql: &str,
+        metadata: &[PgTypeMetadata],
+    ) -> QueryResult<StatementGuarded<'s, Self>> {
         let bind_types = metadata
             .iter()
             .map(type_from_oid)
             .collect::<QueryResult<Vec<_>>>()?;
-
-        let stmt = xitca_postgres::statement::Statement::named(sql, &bind_types)
+        Statement::named(sql, &bind_types)
             .execute(self)
             .await
-            .map_err(error::into_error)?
-            .leak();
-        Ok(StatementGuarded::new(stmt, self.clone()))
+            .map_err(error::into_error)
     }
 }
 
@@ -437,7 +457,7 @@ impl AsyncPgConnection {
     fn with_prepared_statement<'a, T, F, R>(
         &self,
         query: T,
-        callback: impl FnOnce(&Client, Statement, Binds) -> F + Send + 'static,
+        callback: impl FnOnce(&Client, EitherStatement<'_>, Binds) -> F + Send + 'static,
     ) -> BoxFuture<'a, QueryResult<R>>
     where
         T: QueryFragment<Pg> + QueryId,
@@ -471,7 +491,7 @@ impl AsyncPgConnection {
 
     fn with_prepared_statement_after_sql_built<'a, F, R>(
         &self,
-        callback: impl FnOnce(&Client, Statement, Binds) -> F + Send + 'static,
+        callback: impl FnOnce(&Client, EitherStatement<'_>, Binds) -> F + Send + 'static,
         is_safe_to_cache_prepared: QueryResult<bool>,
         query_id: Option<TypeId>,
         to_sql_result: QueryResult<()>,
@@ -520,12 +540,8 @@ impl AsyncPgConnection {
                             if let Some(type_metadata) = metadata_cache.lookup_type(&cache_key) {
                                 type_metadata
                             } else {
-                                let type_metadata = lookup_type(
-                                    schema.clone(),
-                                    lookup_type_name.clone(),
-                                    &raw_connection,
-                                )
-                                .await?;
+                                let type_metadata =
+                                    lookup_type(schema, lookup_type_name, &raw_connection).await?;
                                 metadata_cache.store_type(cache_key, type_metadata);
 
                                 PgTypeMetadata::from_result(Ok(type_metadata))
@@ -763,50 +779,37 @@ where
     }
 }
 
-const LOOK_UP: &str = "\
-SELECT pg_type.oid, pg_type.typarray FROM pg_type \
-INNER JOIN pg_namespace ON pg_type.typnamespace = pg_namespace.oid \
-WHERE pg_type.typname = $1 AND pg_namespace.nspname = $2 \
-LIMIT 1";
+const LOOK_UP: StatementUnnamed = Statement::unnamed(
+    "SELECT pg_type.oid, pg_type.typarray FROM pg_type \
+    INNER JOIN pg_namespace ON pg_type.typnamespace = pg_namespace.oid \
+    WHERE pg_type.typname = $1 AND pg_namespace.nspname = $2 \
+    LIMIT 1",
+    &[],
+);
 
-const LOOK_UP_NO_SCHEMA: &str = "\
-SELECT pg_type.oid, pg_type.typarray FROM pg_type \
-WHERE pg_type.oid = quote_ident($1)::regtype::oid \
-LIMIT 1";
+const LOOK_UP_NO_SCHEMA: StatementUnnamed = Statement::unnamed(
+    "SELECT pg_type.oid, pg_type.typarray FROM pg_type \
+    WHERE pg_type.oid = quote_ident($1)::regtype::oid \
+    LIMIT 1",
+    &[],
+);
 
 async fn lookup_type(
-    schema: Option<String>,
-    type_name: String,
+    schema: &Option<String>,
+    type_name: &String,
     raw_connection: &Client,
 ) -> QueryResult<(u32, u32)> {
     match schema {
-        Some(ref schema) => xitca_postgres::statement::Statement::named(LOOK_UP, &[])
-            .execute(raw_connection)
-            .await
-            .map_err(error::into_error)?
-            .bind_dyn(&[&type_name, schema])
-            .query(raw_connection)
-            .await
-            .map_err(error::into_error)?
-            .try_next()
-            .await
-            .map_err(error::into_error)?
-            .ok_or_else(|| Error::NotFound)
-            .map(|r| (r.get(0), r.get(1))),
-        None => xitca_postgres::statement::Statement::named(LOOK_UP_NO_SCHEMA, &[])
-            .execute(raw_connection)
-            .await
-            .map_err(error::into_error)?
-            .bind([&type_name])
-            .query(raw_connection)
-            .await
-            .map_err(error::into_error)?
-            .try_next()
-            .await
-            .map_err(error::into_error)?
-            .ok_or_else(|| Error::NotFound)
-            .map(|r| (r.get(0), r.get(1))),
+        Some(ref schema) => LOOK_UP.bind([type_name, schema]).query(raw_connection),
+        None => LOOK_UP_NO_SCHEMA.bind([type_name]).query(raw_connection),
     }
+    .await
+    .map_err(error::into_error)?
+    .try_next()
+    .await
+    .map_err(error::into_error)?
+    .ok_or_else(|| Error::NotFound)
+    .map(|r| (r.get(0), r.get(1)))
 }
 
 fn unwrap_oids(metadata: &PgTypeMetadata) -> (u32, u32) {
