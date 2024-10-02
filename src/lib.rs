@@ -305,11 +305,12 @@ fn load_prepared(
     stmt: EitherStatement<'_>,
     binds: Binds,
 ) -> impl Future<Output = Result<RowStream, xitca_postgres::Error>> + Send {
-    let res = stmt
-        .statement_ref()
-        .bind(binds.map(|(a, b)| ToSqlHelper(a, b)))
-        .query(conn)
-        .into_inner()
+    use xitca_postgres::dev::Query;
+    let res = conn
+        ._query(
+            stmt.statement_ref()
+                .bind(binds.map(|(a, b)| ToSqlHelper(a, b))),
+        )
         .map(RowStream::from);
     async { res }
 }
@@ -427,11 +428,10 @@ impl AsyncPgConnection {
     }
 
     async fn set_config_options(&mut self) -> QueryResult<()> {
-        use diesel_async::RunQueryDsl;
-        let res1 = diesel::sql_query("SET TIME ZONE 'UTC'").execute(self);
-        let res2 = diesel::sql_query("SET CLIENT_ENCODING TO 'UTF8'").execute(self);
-        res1.await?;
-        res2.await?;
+        "SET TIME ZONE 'UTC'; SET CLIENT_ENCODING TO 'UTF8'"
+            .execute(&self.conn)
+            .await
+            .map_err(error::into_error)?;
         Ok(())
     }
 
