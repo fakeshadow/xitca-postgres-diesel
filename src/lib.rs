@@ -25,7 +25,10 @@ use std::{
 };
 
 use diesel::{
-    connection::{Instrumentation, InstrumentationEvent, StrQueryHelper},
+    connection::{
+        statement_cache::{PrepareForCache, QueryFragmentForCachedStatement, StatementCache},
+        CacheSize, Instrumentation, InstrumentationEvent, StrQueryHelper,
+    },
     pg::{
         Pg, PgMetadataCache, PgMetadataCacheKey, PgMetadataLookup, PgQueryBuilder, PgTypeMetadata,
     },
@@ -34,44 +37,31 @@ use diesel::{
     },
     result::{ConnectionError, ConnectionResult, Error, QueryResult},
 };
-use diesel_async::{pooled_connection::PoolableConnection, AsyncConnection, SimpleAsyncConnection};
+use diesel_async::{
+    pooled_connection::PoolableConnection, AsyncConnection, AsyncConnectionCore,
+    SimpleAsyncConnection,
+};
 use scoped_futures::ScopedBoxFuture;
 use tokio::sync::Mutex;
 use xitca_postgres::{
     iter::AsyncLendingIterator,
-    statement::{Statement, StatementGuarded, StatementUnnamed},
+    statement::{Statement, StatementUnnamed},
     types::Type,
     Client, Execute,
 };
 
+use crate::cache::CallbackHelper;
+
 use self::{
-    cache::{PrepareCallback, StmtCache},
-    error::ErrorJoiner,
-    row::PgRow,
-    serialize::ToSqlHelper,
-    stream::RowStream,
-    transaction_manager::AnsiTransactionManager,
+    cache::QueryFragmentHelper, error::ErrorJoiner, row::PgRow, serialize::ToSqlHelper,
+    stream::RowStream, transaction_manager::AnsiTransactionManager,
 };
 
 pub use transaction_builder::TransactionBuilder;
 
 const FAKE_OID: u32 = 0;
 
-type StatementShared = Arc<Statement>;
-
-enum EitherStatement<'a> {
-    Onetime(StatementGuarded<'a, Arc<Client>>),
-    Cached(StatementShared),
-}
-
-impl EitherStatement<'_> {
-    fn statement_ref(&self) -> &Statement {
-        match self {
-            Self::Onetime(ref stmt) => stmt,
-            Self::Cached(ref stmt) => stmt,
-        }
-    }
-}
+type StatementGuarded = xitca_postgres::compat::StatementGuarded<Arc<Client>>;
 
 type Binds = Zip<IntoIter<PgTypeMetadata>, IntoIter<Option<Vec<u8>>>>;
 
@@ -115,7 +105,7 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// # }
 pub struct AsyncPgConnection {
     conn: Arc<Client>,
-    stmt_cache: Arc<Mutex<StmtCache>>,
+    stmt_cache: Arc<Mutex<StatementCache<diesel::pg::Pg, StatementGuarded>>>,
     metadata_cache: Arc<Mutex<PgMetadataCache>>,
     error_joiner: ErrorJoiner,
     // a sync mutex is fine here as we only hold it for a really short time
@@ -124,86 +114,68 @@ pub struct AsyncPgConnection {
 
 impl SimpleAsyncConnection for AsyncPgConnection {
     #[inline]
-    fn batch_execute<'s, 'q, 'f>(&'s mut self, query: &'q str) -> BoxFuture<'f, QueryResult<()>>
-    where
-        's: 'f,
-        'q: 'f,
-    {
-        Box::pin(self._batch_execute(query))
+    async fn batch_execute(&mut self, query: &str) -> QueryResult<()> {
+        SimpleAsyncConnection::batch_execute(&mut &*self, query).await
     }
 }
 
 impl SimpleAsyncConnection for &AsyncPgConnection {
     #[inline]
-    fn batch_execute<'s, 'q, 'f>(&'s mut self, query: &'q str) -> BoxFuture<'f, QueryResult<()>>
-    where
-        's: 'f,
-        'q: 'f,
-    {
-        Box::pin(self._batch_execute(query))
+    async fn batch_execute(&mut self, query: &str) -> QueryResult<()> {
+        self.record_instrumentation(InstrumentationEvent::start_query(&StrQueryHelper::new(
+            query,
+        )));
+        let batch_execute = query.execute(&self.conn);
+
+        let res = match batch_execute.await {
+            Ok(_) => Ok(()),
+            Err(e) => Err(self.error_joiner.join(e).await),
+        };
+
+        self.record_instrumentation(InstrumentationEvent::finish_query(
+            &StrQueryHelper::new(query),
+            res.as_ref().err(),
+        ));
+
+        res
     }
 }
 
-impl AsyncConnection for AsyncPgConnection {
-    type ExecuteFuture<'conn, 'query> = BoxFuture<'query, QueryResult<usize>>;
+impl AsyncConnectionCore for AsyncPgConnection {
     type LoadFuture<'conn, 'query> = BoxFuture<'query, QueryResult<Self::Stream<'conn, 'query>>>;
+    type ExecuteFuture<'conn, 'query> = BoxFuture<'query, QueryResult<usize>>;
     type Stream<'conn, 'query> = RowStream;
     type Row<'conn, 'query> = PgRow;
-    type Backend = Pg;
-    type TransactionManager = AnsiTransactionManager;
+    type Backend = diesel::pg::Pg;
 
-    fn establish<'d, 'f>(database_url: &'d str) -> BoxFuture<'f, ConnectionResult<Self>>
+    fn load<'conn, 'query, T>(&'conn mut self, source: T) -> Self::LoadFuture<'conn, 'query>
     where
-        'd: 'f,
+        T: AsQuery + 'query,
+        T::Query: QueryFragment<Self::Backend> + QueryId + 'query,
     {
-        let mut instrumentation = diesel::connection::get_default_instrumentation();
-        instrumentation.on_connection_event(InstrumentationEvent::start_establish_connection(
-            database_url,
-        ));
-        let instrumentation = Arc::new(std::sync::Mutex::new(instrumentation)) as _;
-        Box::pin(async move {
-            let (client, driver) = xitca_postgres::Postgres::new(database_url)
-                .connect()
-                .await
-                .map_err(error::into_connection_error)?;
-
-            let handle = tokio::spawn(async move {
-                driver
-                    .into_future()
-                    .await
-                    // TODO: diesel async should be treat driver graceful shutdown as non error.
-                    .err()
-                    .unwrap_or_else(|| xitca_postgres::error::DriverDown.into())
-            });
-
-            let r = Self::setup(
-                client,
-                ErrorJoiner::new(Some(handle)),
-                Arc::clone(&instrumentation),
-            )
-            .await;
-            instrumentation
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .on_connection_event(InstrumentationEvent::finish_establish_connection(
-                    database_url,
-                    r.as_ref().err(),
-                ));
-            r
-        })
+        AsyncConnectionCore::load(&mut &*self, source)
     }
 
-    fn transaction<'a, 's, 'f, R, E, F>(&'s mut self, _: F) -> BoxFuture<'f, Result<R, E>>
+    fn execute_returning_count<'conn, 'query, T>(
+        &'conn mut self,
+        source: T,
+    ) -> Self::ExecuteFuture<'conn, 'query>
     where
-        F: for<'r> FnOnce(&'r mut Self) -> ScopedBoxFuture<'a, 'r, Result<R, E>> + Send + 'a,
-        E: From<diesel::result::Error> + Send + 'a,
-        R: Send + 'a,
-        's: 'f,
+        T: QueryFragment<Self::Backend> + QueryId + 'query,
     {
-        unimplemented!("transaction is temporary disabled")
+        AsyncConnectionCore::execute_returning_count(&mut &*self, source)
     }
+}
 
-    #[inline]
+impl AsyncConnectionCore for &AsyncPgConnection {
+    type LoadFuture<'conn, 'query> =
+        <AsyncPgConnection as AsyncConnectionCore>::LoadFuture<'conn, 'query>;
+    type ExecuteFuture<'conn, 'query> =
+        <AsyncPgConnection as AsyncConnectionCore>::ExecuteFuture<'conn, 'query>;
+    type Stream<'conn, 'query> = <AsyncPgConnection as AsyncConnectionCore>::Stream<'conn, 'query>;
+    type Row<'conn, 'query> = <AsyncPgConnection as AsyncConnectionCore>::Row<'conn, 'query>;
+    type Backend = <AsyncPgConnection as AsyncConnectionCore>::Backend;
+
     fn load<'conn, 'query, T>(&'conn mut self, source: T) -> Self::LoadFuture<'conn, 'query>
     where
         T: AsQuery + 'query,
@@ -212,7 +184,6 @@ impl AsyncConnection for AsyncPgConnection {
         self.with_prepared_statement(source.as_query(), load_prepared)
     }
 
-    #[inline]
     fn execute_returning_count<'conn, 'query, T>(
         &'conn mut self,
         source: T,
@@ -221,6 +192,56 @@ impl AsyncConnection for AsyncPgConnection {
         T: QueryFragment<Self::Backend> + QueryId + 'query,
     {
         self.with_prepared_statement(source, execute_prepared)
+    }
+}
+
+impl AsyncConnection for AsyncPgConnection {
+    type TransactionManager = AnsiTransactionManager;
+
+    async fn establish(database_url: &str) -> ConnectionResult<Self> {
+        let mut instrumentation = diesel::connection::get_default_instrumentation();
+        instrumentation.on_connection_event(InstrumentationEvent::start_establish_connection(
+            database_url,
+        ));
+        let instrumentation = Arc::new(std::sync::Mutex::new(instrumentation)) as _;
+        let (client, driver) = xitca_postgres::Postgres::new(database_url)
+            .connect()
+            .await
+            .map_err(error::into_connection_error)?;
+
+        let handle = tokio::spawn(async move {
+            driver
+                .into_future()
+                .await
+                // TODO: diesel async should be treat driver graceful shutdown as non error.
+                .err()
+                .unwrap_or_else(|| xitca_postgres::error::DriverDown.into())
+        });
+
+        let r = Self::setup(
+            client,
+            ErrorJoiner::new(Some(handle)),
+            Arc::clone(&instrumentation),
+        )
+        .await;
+        instrumentation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .on_connection_event(InstrumentationEvent::finish_establish_connection(
+                database_url,
+                r.as_ref().err(),
+            ));
+        r
+    }
+
+    fn transaction<'a, 'conn, R, E, F>(&'conn mut self, _: F) -> BoxFuture<'conn, Result<R, E>>
+    where
+        F: for<'r> FnOnce(&'r mut Self) -> ScopedBoxFuture<'a, 'r, Result<R, E>> + Send + 'a,
+        E: From<diesel::result::Error> + Send + 'a,
+        R: Send + 'a,
+        'a: 'conn,
+    {
+        unimplemented!("transaction is temporary disabled")
     }
 
     fn transaction_state(&mut self) -> &mut AnsiTransactionManager {
@@ -240,108 +261,40 @@ impl AsyncConnection for AsyncPgConnection {
     fn set_instrumentation(&mut self, instrumentation: impl Instrumentation) {
         self.instrumentation = Arc::new(std::sync::Mutex::new(instrumentation));
     }
-}
 
-impl AsyncConnection for &AsyncPgConnection {
-    type ExecuteFuture<'conn, 'query> =
-        <AsyncPgConnection as AsyncConnection>::ExecuteFuture<'conn, 'query>;
-    type LoadFuture<'conn, 'query> =
-        <AsyncPgConnection as AsyncConnection>::LoadFuture<'conn, 'query>;
-    type Stream<'conn, 'query> = <AsyncPgConnection as AsyncConnection>::Stream<'conn, 'query>;
-    type Row<'conn, 'query> = <AsyncPgConnection as AsyncConnection>::Row<'conn, 'query>;
-    type Backend = <AsyncPgConnection as AsyncConnection>::Backend;
-    type TransactionManager = <AsyncPgConnection as AsyncConnection>::TransactionManager;
-
-    fn establish<'d, 'f>(_: &'d str) -> BoxFuture<'f, ConnectionResult<Self>>
-    where
-        'd: 'f,
-    {
-        unimplemented!("&AsyncPgConnection can't be used to construct a new connection")
-    }
-
-    fn transaction<'a, 's, 'f, R, E, F>(&'s mut self, _: F) -> BoxFuture<'f, Result<R, E>>
-    where
-        F: for<'r> FnOnce(&'r mut Self) -> ScopedBoxFuture<'a, 'r, Result<R, E>> + Send + 'a,
-        E: From<diesel::result::Error> + Send + 'a,
-        R: Send + 'a,
-        's: 'f,
-    {
-        unimplemented!("&AsyncPgConnection can't be used for transaction")
-    }
-
-    fn load<'conn, 'query, T>(&'conn mut self, source: T) -> Self::LoadFuture<'conn, 'query>
-    where
-        T: AsQuery + 'query,
-        T::Query: QueryFragment<Self::Backend> + QueryId + 'query,
-    {
-        self.with_prepared_statement(source.as_query(), load_prepared)
-    }
-
-    fn execute_returning_count<'conn, 'query, T>(
-        &'conn mut self,
-        source: T,
-    ) -> Self::ExecuteFuture<'conn, 'query>
-    where
-        T: QueryFragment<Self::Backend> + QueryId + 'query,
-    {
-        self.with_prepared_statement(source, execute_prepared)
-    }
-
-    fn transaction_state(&mut self) -> &mut AnsiTransactionManager {
-        unimplemented!("&AsyncPgConnection can't be used for transaction")
-    }
-
-    fn instrumentation(&mut self) -> &mut dyn Instrumentation {
-        unimplemented!("&AsyncPgConnection can't be used for instrumentation")
-    }
-
-    fn set_instrumentation(&mut self, _: impl Instrumentation) {
-        unimplemented!("&AsyncPgConnection can't be used for instrumentation")
+    fn set_prepared_statement_cache_size(&mut self, size: CacheSize) {
+        // there should be no other pending future when this is called
+        // that means there is only one instance of this arc and
+        // we can simply access the inner data
+        if let Some(cache) = Arc::get_mut(&mut self.stmt_cache) {
+            cache.get_mut().set_cache_size(size)
+        } else {
+            panic!("Cannot access shared statement cache")
+        }
     }
 }
 
 fn load_prepared(
     conn: &Client,
-    stmt: EitherStatement<'_>,
+    stmt: StatementGuarded,
     binds: Binds,
 ) -> impl Future<Output = Result<RowStream, xitca_postgres::Error>> + Send {
     use xitca_postgres::dev::Query;
     let res = conn
-        ._query(
-            stmt.statement_ref()
-                .bind(binds.map(|(a, b)| ToSqlHelper(a, b))),
-        )
+        ._query(stmt.bind(binds.map(|(a, b)| ToSqlHelper(a, b))))
         .map(RowStream::from);
     async { res }
 }
 
 fn execute_prepared(
     conn: &Client,
-    stmt: EitherStatement<'_>,
+    stmt: StatementGuarded,
     binds: Binds,
 ) -> impl Future<Output = Result<usize, xitca_postgres::Error>> + Send {
     let res = stmt
-        .statement_ref()
         .bind(binds.map(|(a, b)| ToSqlHelper(a, b)))
         .execute(conn);
     async { res.await.map(|n| n as _) }
-}
-
-impl PrepareCallback for Arc<Client> {
-    async fn prepare<'s>(
-        &'s self,
-        sql: &str,
-        metadata: &[PgTypeMetadata],
-    ) -> QueryResult<StatementGuarded<'s, Self>> {
-        let bind_types = metadata
-            .iter()
-            .map(type_from_oid)
-            .collect::<QueryResult<Vec<_>>>()?;
-        Statement::named(sql, &bind_types)
-            .execute(self)
-            .await
-            .map_err(error::into_error)
-    }
 }
 
 fn type_from_oid(t: &PgTypeMetadata) -> QueryResult<Type> {
@@ -388,7 +341,7 @@ impl AsyncPgConnection {
     ///     .await
     /// # }
     /// ```
-    pub fn build_transaction(&mut self) -> TransactionBuilder<Self> {
+    pub fn build_transaction(&mut self) -> TransactionBuilder<'_, Self> {
         TransactionBuilder::new(self)
     }
 
@@ -411,7 +364,7 @@ impl AsyncPgConnection {
     ) -> ConnectionResult<Self> {
         let mut conn = Self {
             conn: Arc::new(conn),
-            stmt_cache: Arc::new(Mutex::new(StmtCache::new())),
+            stmt_cache: Arc::new(Mutex::new(StatementCache::new())),
             metadata_cache: Arc::new(Mutex::new(PgMetadataCache::new())),
             error_joiner,
             instrumentation,
@@ -435,29 +388,10 @@ impl AsyncPgConnection {
         Ok(())
     }
 
-    async fn _batch_execute(&self, query: &str) -> QueryResult<()> {
-        self.record_instrumentation(InstrumentationEvent::start_query(&StrQueryHelper::new(
-            query,
-        )));
-        let batch_execute = query.execute(&self.conn);
-
-        let res = match batch_execute.await {
-            Ok(_) => Ok(()),
-            Err(e) => Err(self.error_joiner.join(e).await),
-        };
-
-        self.record_instrumentation(InstrumentationEvent::finish_query(
-            &StrQueryHelper::new(query),
-            res.as_ref().err(),
-        ));
-
-        res
-    }
-
     fn with_prepared_statement<'a, T, F, R>(
         &self,
         query: T,
-        callback: impl FnOnce(&Client, EitherStatement<'_>, Binds) -> F + Send + 'static,
+        callback: impl FnOnce(&Client, StatementGuarded, Binds) -> F + Send + 'static,
     ) -> BoxFuture<'a, QueryResult<R>>
     where
         T: QueryFragment<Pg> + QueryId,
@@ -491,7 +425,7 @@ impl AsyncPgConnection {
 
     fn with_prepared_statement_after_sql_built<'a, F, R>(
         &self,
-        callback: impl FnOnce(&Client, EitherStatement<'_>, Binds) -> F + Send + 'static,
+        callback: impl FnOnce(&Client, StatementGuarded, Binds) -> F + Send + 'static,
         is_safe_to_cache_prepared: QueryResult<bool>,
         query_id: Option<TypeId>,
         to_sql_result: QueryResult<()>,
@@ -571,18 +505,34 @@ impl AsyncPgConnection {
                     }
                 }
 
-                let stmt = stmt_cache
-                    .lock()
-                    .await
-                    .cached_prepared_statement(
-                        query_id,
-                        sql.clone(),
-                        is_safe_to_cache_prepared,
-                        &bind_collector.metadata,
-                        &raw_connection,
-                        &instrumentation,
-                    )
-                    .await?;
+                let stmt = {
+                    let mut stmt_cache = stmt_cache.lock().await;
+                    let helper = QueryFragmentHelper {
+                        sql: sql.clone(),
+                        safe_to_cache: is_safe_to_cache_prepared,
+                    };
+                    let instrumentation = Arc::clone(&instrumentation);
+                    stmt_cache
+                        .cached_statement_non_generic(
+                            query_id,
+                            &helper,
+                            &Pg,
+                            &bind_collector.metadata,
+                            raw_connection.clone(),
+                            prepare_statement_helper,
+                            &mut move |event: InstrumentationEvent<'_>| {
+                                // we wrap this lock into another callback to prevent locking
+                                // the instrumentation longer than necessary
+                                instrumentation
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .on_connection_event(event);
+                            },
+                        )
+                        .await?
+                        .0
+                        .clone()
+                };
 
                 let binds = bind_collector
                     .metadata
@@ -841,4 +791,37 @@ impl PoolableConnection for AsyncPgConnection {
     fn is_broken(&mut self) -> bool {
         self.conn.closed()
     }
+}
+
+impl QueryFragmentForCachedStatement<Pg> for QueryFragmentHelper {
+    fn construct_sql(&self, _backend: &Pg) -> QueryResult<String> {
+        Ok(self.sql.clone())
+    }
+
+    fn is_safe_to_cache_prepared(&self, _backend: &Pg) -> QueryResult<bool> {
+        Ok(self.safe_to_cache)
+    }
+}
+
+fn prepare_statement_helper(
+    conn: Arc<Client>,
+    sql: &str,
+    _is_for_cache: PrepareForCache,
+    metadata: &[PgTypeMetadata],
+) -> CallbackHelper<impl Future<Output = QueryResult<(StatementGuarded, Arc<Client>)>> + Send + use<>>
+{
+    let bind_types = metadata
+        .iter()
+        .map(type_from_oid)
+        .collect::<QueryResult<Vec<_>>>();
+    let sql = sql.to_string();
+    CallbackHelper(async move {
+        let bind_types = bind_types?;
+        let stmt = xitca_postgres::Statement::named(&sql, &bind_types)
+            .execute(&conn)
+            .await
+            .map_err(error::into_error)?
+            .leak();
+        Ok((StatementGuarded::new(stmt, conn.clone()), conn))
+    })
 }

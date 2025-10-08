@@ -1,87 +1,60 @@
-use core::{any::TypeId, future::Future};
-
-use std::{collections::HashMap, sync::Arc};
+use core::future::{ready, Future, Ready};
 
 use diesel::{
-    connection::{statement_cache::StatementCacheKey, Instrumentation, InstrumentationEvent},
-    pg::{Pg, PgTypeMetadata},
-    result::QueryResult,
+    connection::statement_cache::{MaybeCached, StatementCallbackReturnType},
+    QueryResult,
 };
-use xitca_postgres::{dev::Query, statement::StatementGuarded, Client};
+use futures_util::future::{BoxFuture, Either, FutureExt, TryFutureExt};
 
-use crate::{EitherStatement, StatementShared};
+pub(crate) struct CallbackHelper<F>(pub(crate) F);
 
-#[derive(Default)]
-pub struct StmtCache {
-    cache: HashMap<StatementCacheKey<Pg>, StatementShared>,
-}
+type PrepareFuture<'a, C, S> = Either<
+    Ready<QueryResult<(MaybeCached<'a, S>, C)>>,
+    BoxFuture<'a, QueryResult<(MaybeCached<'a, S>, C)>>,
+>;
 
-pub trait PrepareCallback: Query + Sized {
-    fn prepare<'s>(
-        &'s self,
-        sql: &str,
-        metadata: &[PgTypeMetadata],
-    ) -> impl Future<Output = QueryResult<StatementGuarded<'s, Self>>> + Send;
-}
+impl<S, F, C> StatementCallbackReturnType<S, C> for CallbackHelper<F>
+where
+    F: Future<Output = QueryResult<(S, C)>> + Send,
+    S: 'static,
+{
+    type Return<'a> = PrepareFuture<'a, C, S>;
 
-impl StmtCache {
-    pub fn new() -> Self {
-        Self {
-            cache: HashMap::new(),
-        }
+    fn from_error<'a>(e: diesel::result::Error) -> Self::Return<'a> {
+        Either::Left(ready(Err(e)))
     }
 
-    pub async fn cached_prepared_statement<'c>(
-        &mut self,
-        query_id: Option<TypeId>,
-        sql: String,
-        is_query_safe_to_cache: bool,
-        metadata: &[PgTypeMetadata],
-        prepare_fn: &'c Arc<Client>,
-        instrumentation: &std::sync::Mutex<dyn Instrumentation>,
-    ) -> QueryResult<EitherStatement<'c>> {
-        if !is_query_safe_to_cache {
-            return Box::pin(prepare_fn.prepare(&sql, metadata))
-                .await
-                .map(EitherStatement::Onetime);
-        }
-
-        let (cache_key, opt) = match query_id {
-            Some(id) => (StatementCacheKey::Type(id), Some((sql, metadata))),
-            None => (
-                StatementCacheKey::Sql {
-                    sql,
-                    bind_types: metadata.to_owned(),
-                },
-                None,
-            ),
-        };
-
-        if let Some(stmt) = self.cache.get(&cache_key) {
-            return Ok(EitherStatement::Cached(stmt.clone()));
-        }
-
-        Box::pin(async move {
-            let (sql, meta) = match cache_key {
-                StatementCacheKey::Type(ref _id) => {
-                    opt.as_ref().map(|(sql, meta)| (sql, *meta)).unwrap()
-                }
-                StatementCacheKey::Sql {
-                    ref sql,
-                    ref bind_types,
-                } => (sql, &**bind_types),
-            };
-
-            instrumentation
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .on_connection_event(InstrumentationEvent::cache_query(sql));
-
-            let stmt = prepare_fn.prepare(sql, meta).await?.leak();
-            let stmt = Arc::new(stmt);
-            self.cache.insert(cache_key, stmt.clone());
-            Ok(EitherStatement::Cached(stmt))
-        })
-        .await
+    fn map_to_no_cache<'a>(self) -> Self::Return<'a>
+    where
+        Self: 'a,
+    {
+        Either::Right(
+            self.0
+                .map_ok(|(stmt, conn)| (MaybeCached::CannotCache(stmt), conn))
+                .boxed(),
+        )
     }
+
+    fn map_to_cache(stmt: &mut S, conn: C) -> Self::Return<'_> {
+        Either::Left(ready(Ok((MaybeCached::Cached(stmt), conn))))
+    }
+
+    fn register_cache<'a>(
+        self,
+        callback: impl FnOnce(S) -> &'a mut S + Send + 'a,
+    ) -> Self::Return<'a>
+    where
+        Self: 'a,
+    {
+        Either::Right(
+            self.0
+                .map_ok(|(stmt, conn)| (MaybeCached::Cached(callback(stmt)), conn))
+                .boxed(),
+        )
+    }
+}
+
+pub(crate) struct QueryFragmentHelper {
+    pub(crate) sql: String,
+    pub(crate) safe_to_cache: bool,
 }

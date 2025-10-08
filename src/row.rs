@@ -47,7 +47,7 @@ impl<'a> Row<'a, Pg> for PgRow {
         })
     }
 
-    fn partial_row(&self, range: Range<usize>) -> PartialRow<Self::InnerPartialRow> {
+    fn partial_row(&self, range: Range<usize>) -> PartialRow<'_, Self::InnerPartialRow> {
         PartialRow::new(self, range)
     }
 }

@@ -88,7 +88,7 @@ where
         PoolBuilder::default()
     }
 
-    pub async fn get(&self) -> Result<PoolConnection<C>, ConnectionError> {
+    pub async fn get(&self) -> Result<PoolConnection<'_, C>, ConnectionError> {
         let _permit = self.permits.acquire().await.unwrap();
         let conn = self.conn.lock().unwrap().pop_front();
         let conn = match conn {
