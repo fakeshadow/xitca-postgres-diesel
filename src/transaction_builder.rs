@@ -1,7 +1,9 @@
-use diesel::backend::Backend;
-use diesel::pg::Pg;
-use diesel::query_builder::{AstPass, QueryBuilder, QueryFragment};
-use diesel::QueryResult;
+use diesel::{
+    QueryResult,
+    backend::Backend,
+    pg::Pg,
+    query_builder::{AstPass, QueryBuilder, QueryFragment},
+};
 use diesel_async::{AsyncConnection, TransactionManager};
 use scoped_futures::ScopedBoxFuture;
 
@@ -393,9 +395,9 @@ mod tests {
             };
         }
 
-        let database_url =
-            dbg!(std::env::var("DATABASE_URL")
-                .expect("DATABASE_URL must be set in order to run tests"));
+        let database_url = dbg!(
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set in order to run tests")
+        );
         let mut conn = crate::AsyncPgConnection::establish(&database_url)
             .await
             .unwrap();

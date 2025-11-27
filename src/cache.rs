@@ -1,8 +1,8 @@
-use core::future::{ready, Future, Ready};
+use core::future::{Future, Ready, ready};
 
 use diesel::{
-    connection::statement_cache::{MaybeCached, StatementCallbackReturnType},
     QueryResult,
+    connection::statement_cache::{MaybeCached, StatementCallbackReturnType},
 };
 use futures_util::future::{BoxFuture, Either, FutureExt, TryFutureExt};
 

@@ -8,8 +8,8 @@ use core::{
 use std::{
     collections::VecDeque,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Mutex,
+        atomic::{AtomicUsize, Ordering},
     },
 };
 
@@ -17,7 +17,7 @@ use diesel::ConnectionError;
 use diesel_async::pooled_connection::PoolableConnection;
 use tokio::{
     runtime::Handle,
-    sync::{oneshot, Semaphore, SemaphorePermit},
+    sync::{Semaphore, SemaphorePermit, oneshot},
 };
 use xitca_postgres::Config;
 
@@ -158,8 +158,8 @@ where
 #[cfg(test)]
 mod test {
     use diesel_async::{
-        pooled_connection::{bb8, AsyncDieselConnectionManager},
         RunQueryDsl,
+        pooled_connection::{AsyncDieselConnectionManager, bb8},
     };
 
     #[tokio::test]

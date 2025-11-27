@@ -1,7 +1,7 @@
 use core::{
-    future::{poll_fn, Future},
+    future::{Future, poll_fn},
     pin::Pin,
-    task::{ready, Poll},
+    task::{Poll, ready},
 };
 
 use std::sync::{Arc, Mutex};
@@ -36,23 +36,23 @@ impl ErrorJoiner {
             // when xitca_postgres emit driver shutdown error it means it's Driver
             // task has shutdown already. in this case just await for the driver error
             // to show up from join handle and replace client's error type.
-            if e.is_driver_down() {
-                if let Some(ref inner) = self.handle {
-                    return poll_fn(|cx| {
-                        let mut inner = inner.lock().unwrap();
-                        match *inner {
-                            JoinerInner::Error(ref e) => Poll::Ready(into_error_ref(e)),
-                            JoinerInner::Handle(ref mut handle) => {
-                                let err = ready!(Pin::new(handle).poll(cx))
-                                    .expect("Driver's task must not panic");
-                                let e = into_error_ref(&err);
-                                let _ = core::mem::replace(&mut *inner, JoinerInner::Error(err));
-                                Poll::Ready(e)
-                            }
+            if e.is_driver_down()
+                && let Some(ref inner) = self.handle
+            {
+                return poll_fn(|cx| {
+                    let mut inner = inner.lock().unwrap();
+                    match *inner {
+                        JoinerInner::Error(ref e) => Poll::Ready(into_error_ref(e)),
+                        JoinerInner::Handle(ref mut handle) => {
+                            let err = ready!(Pin::new(handle).poll(cx))
+                                .expect("Driver's task must not panic");
+                            let e = into_error_ref(&err);
+                            let _ = core::mem::replace(&mut *inner, JoinerInner::Error(err));
+                            Poll::Ready(e)
                         }
-                    })
-                    .await;
-                }
+                    }
+                })
+                .await;
             }
             into_error_ref(&e)
         })

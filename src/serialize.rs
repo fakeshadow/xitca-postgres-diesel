@@ -1,7 +1,7 @@
 use std::error;
 
 use diesel::pg::PgTypeMetadata;
-use xitca_postgres::types::{private::BytesMut, IsNull, ToSql, Type, WrongType};
+use xitca_postgres::types::{IsNull, ToSql, Type, WrongType, private::BytesMut};
 
 #[derive(Debug)]
 pub(super) struct ToSqlHelper(pub(super) PgTypeMetadata, pub(super) Option<Vec<u8>>);
