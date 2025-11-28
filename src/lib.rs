@@ -440,8 +440,11 @@ impl AsyncPgConnection {
         let raw_connection = self.conn.clone();
         let stmt_cache = self.stmt_cache.clone();
         let metadata_cache = self.metadata_cache.clone();
-        let instrumentation = self.instrumentation.clone();
         let error_joiner = self.error_joiner.clone();
+
+        #[cfg(feature = "instrumentation")]
+        let instrumentation = self.instrumentation.clone();
+
         let BindData {
             collect_bind_result,
             fake_oid_locations,
@@ -504,28 +507,37 @@ impl AsyncPgConnection {
                 }
             }
 
+            #[cfg(feature = "instrumentation")]
             let instrument = instrumentation.clone();
+
+            let source = QueryFragmentHelper {
+                #[cfg(feature = "instrumentation")]
+                sql: sql.clone(),
+                #[cfg(not(feature = "instrumentation"))]
+                sql,
+                safe_to_cache: is_safe_to_cache_prepared,
+            };
 
             let stmt = stmt_cache
                 .lock()
                 .await
                 .cached_statement_non_generic(
                     query_id,
-                    &QueryFragmentHelper {
-                        sql: sql.clone(),
-                        safe_to_cache: is_safe_to_cache_prepared,
-                    },
+                    &source,
                     &Pg,
                     &bind_collector.metadata,
                     raw_connection,
                     prepare_statement_helper,
-                    &mut move |event: InstrumentationEvent<'_>| {
-                        // we wrap this lock into another callback to prevent locking
-                        // the instrumentation longer than necessary
-                        instrument
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .on_connection_event(event);
+                    &mut move |_event: InstrumentationEvent<'_>| {
+                        #[cfg(feature = "instrumentation")]
+                        {
+                            // we wrap this lock into another callback to prevent locking
+                            // the instrumentation longer than necessary
+                            instrument
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .on_connection_event(_event);
+                        }
                     },
                 )
                 .await?
