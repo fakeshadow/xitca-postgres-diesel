@@ -27,7 +27,9 @@ use std::{
 use diesel::{
     connection::{
         CacheSize, Instrumentation, InstrumentationEvent, StrQueryHelper,
-        statement_cache::{PrepareForCache, QueryFragmentForCachedStatement, StatementCache},
+        statement_cache::{
+            MaybeCached, PrepareForCache, QueryFragmentForCachedStatement, StatementCache,
+        },
     },
     pg::{
         Pg, PgMetadataCache, PgMetadataCacheKey, PgMetadataLookup, PgQueryBuilder, PgTypeMetadata,
@@ -518,7 +520,7 @@ impl AsyncPgConnection {
                 safe_to_cache: is_safe_to_cache_prepared,
             };
 
-            let stmt = stmt_cache
+            let stmt = match stmt_cache
                 .lock()
                 .await
                 .cached_statement_non_generic(
@@ -542,7 +544,11 @@ impl AsyncPgConnection {
                 )
                 .await?
                 .0
-                .clone();
+            {
+                MaybeCached::Cached(stmt) => stmt.clone(),
+                MaybeCached::CannotCache(stmt) => stmt,
+                _ => panic!("caching variant not supported"),
+            };
 
             let binds = bind_collector
                 .metadata
