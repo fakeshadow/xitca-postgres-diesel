@@ -27,9 +27,7 @@ use std::{
 use diesel::{
     connection::{
         CacheSize, Instrumentation, InstrumentationEvent, StrQueryHelper,
-        statement_cache::{
-            MaybeCached, PrepareForCache, QueryFragmentForCachedStatement, StatementCache,
-        },
+        statement_cache::{PrepareForCache, QueryFragmentForCachedStatement, StatementCache},
     },
     pg::{
         Pg, PgMetadataCache, PgMetadataCacheKey, PgMetadataLookup, PgQueryBuilder, PgTypeMetadata,
@@ -64,8 +62,6 @@ use self::{
 pub use transaction_builder::TransactionBuilder;
 
 const FAKE_OID: u32 = 0;
-
-type StatementGuarded = xitca_postgres::compat::StatementGuarded<Arc<Client>>;
 
 type Binds = Zip<IntoIter<PgTypeMetadata>, IntoIter<Option<Vec<u8>>>>;
 
@@ -115,7 +111,7 @@ pub struct AsyncPgConnection {
 }
 
 struct Cache {
-    stmt: Mutex<StatementCache<diesel::pg::Pg, StatementGuarded>>,
+    stmt: Mutex<StatementCache<diesel::pg::Pg, Statement>>,
     meta: Mutex<PgMetadataCache>,
     error_joiner: ErrorJoiner,
 }
@@ -281,24 +277,29 @@ impl AsyncConnection for AsyncPgConnection {
     }
 }
 
-async fn load_prepared(
-    stmt: StatementGuarded,
+fn load_prepared(
+    stmt: &Statement,
+    cli: &Client,
     binds: Binds,
-) -> Result<RowStream, xitca_postgres::Error> {
-    stmt.bind(binds.map(|(a, b)| ToSqlHelper(a, b)))
-        .query(stmt.client())
-        .await
-        .map(RowStream::from)
+) -> impl Future<Output = Result<RowStream, xitca_postgres::Error>> + Send + use<> {
+    let res = stmt
+        .bind(binds.map(|(a, b)| ToSqlHelper(a, b)))
+        .query(cli)
+        .into_inner()
+        .map(RowStream::from);
+
+    async { res }
 }
 
-async fn execute_prepared(
-    stmt: StatementGuarded,
+fn execute_prepared(
+    stmt: &Statement,
+    cli: &Client,
     binds: Binds,
-) -> Result<usize, xitca_postgres::Error> {
-    stmt.bind(binds.map(|(a, b)| ToSqlHelper(a, b)))
-        .execute(stmt.client())
-        .await
-        .map(|n| n as _)
+) -> impl Future<Output = Result<usize, xitca_postgres::Error>> + Send + use<> {
+    let res = stmt
+        .bind(binds.map(|(a, b)| ToSqlHelper(a, b)))
+        .execute(cli);
+    async { res.await.map(|n| n as _) }
 }
 
 fn type_from_oid(t: &PgTypeMetadata) -> QueryResult<Type> {
@@ -392,14 +393,15 @@ impl AsyncPgConnection {
         Ok(())
     }
 
-    fn with_prepared_statement<'a, T, F, R>(
+    fn with_prepared_statement<T, C, F, R>(
         &self,
         query: T,
-        callback: impl FnOnce(StatementGuarded, Binds) -> F + Send + 'static,
-    ) -> BoxFuture<'a, QueryResult<R>>
+        callback: C,
+    ) -> BoxFuture<'static, QueryResult<R>>
     where
         T: QueryFragment<Pg> + QueryId,
-        F: Future<Output = Result<R, xitca_postgres::Error>> + Send + 'a,
+        C: FnOnce(&Statement, &Client, Binds) -> F + Send + 'static,
+        F: Future<Output = Result<R, xitca_postgres::Error>> + Send + 'static,
         R: Send,
     {
         #[cfg(feature = "instrumentation")]
@@ -433,16 +435,17 @@ impl AsyncPgConnection {
         )
     }
 
-    fn with_prepared_statement_after_sql_built<'a, F, R>(
+    fn with_prepared_statement_after_sql_built<C, F, R>(
         &self,
-        callback: impl FnOnce(StatementGuarded, Binds) -> F + Send + 'static,
+        callback: C,
         is_safe_to_cache_prepared: QueryResult<bool>,
         query_id: Option<TypeId>,
         to_sql: QueryResult<String>,
         bind_data: BindData,
-    ) -> BoxFuture<'a, QueryResult<R>>
+    ) -> BoxFuture<'static, QueryResult<R>>
     where
-        F: Future<Output = Result<R, xitca_postgres::Error>> + Send + 'a,
+        C: FnOnce(&Statement, &Client, Binds) -> F + Send + 'static,
+        F: Future<Output = Result<R, xitca_postgres::Error>> + Send + 'static,
         R: Send,
     {
         let raw_connection = self.conn.clone();
@@ -524,7 +527,7 @@ impl AsyncPgConnection {
                 safe_to_cache: is_safe_to_cache_prepared,
             };
 
-            let stmt = match cache
+            let res = cache
                 .stmt
                 .lock()
                 .await
@@ -547,20 +550,17 @@ impl AsyncPgConnection {
                         }
                     },
                 )
-                .await?
-                .0
-            {
-                MaybeCached::Cached(stmt) => stmt.clone(),
-                MaybeCached::CannotCache(stmt) => stmt,
-                _ => panic!("caching variant not supported"),
-            };
+                .await
+                .map(|(stmt, cli)| {
+                    let binds = bind_collector
+                        .metadata
+                        .into_iter()
+                        .zip(bind_collector.binds);
 
-            let binds = bind_collector
-                .metadata
-                .into_iter()
-                .zip(bind_collector.binds);
+                    callback(&*stmt, &cli, binds)
+                })?;
 
-            let res = match callback(stmt, binds).await {
+            let res = match res.await {
                 Ok(res) => Ok(res),
                 Err(e) => Err(cache.error_joiner.join(e).await),
             };
@@ -841,8 +841,7 @@ fn prepare_statement_helper(
     sql: &str,
     _is_for_cache: PrepareForCache,
     metadata: &[PgTypeMetadata],
-) -> CallbackHelper<impl Future<Output = QueryResult<(StatementGuarded, Arc<Client>)>> + Send + use<>>
-{
+) -> CallbackHelper<impl Future<Output = QueryResult<(Statement, Arc<Client>)>> + Send + use<>> {
     let bind_types = metadata
         .iter()
         .map(type_from_oid)
@@ -855,6 +854,6 @@ fn prepare_statement_helper(
             .await
             .map_err(error::into_error)?
             .leak();
-        Ok((StatementGuarded::new(stmt, conn.clone()), conn))
+        Ok((stmt, conn))
     })
 }
