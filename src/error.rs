@@ -4,16 +4,15 @@ use core::{
     task::{Poll, ready},
 };
 
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use diesel::result::{ConnectionError, DatabaseErrorInformation, Error};
 use tokio::task::JoinHandle;
 
 use crate::BoxFuture;
 
-#[derive(Clone)]
 pub(crate) struct ErrorJoiner {
-    handle: Option<Arc<std::sync::Mutex<JoinerInner>>>,
+    handle: Option<std::sync::Mutex<JoinerInner>>,
 }
 
 enum JoinerInner {
@@ -24,7 +23,7 @@ enum JoinerInner {
 impl ErrorJoiner {
     pub(crate) fn new(handle: Option<JoinHandle<xitca_postgres::Error>>) -> Self {
         Self {
-            handle: handle.map(|handle| Arc::new(Mutex::new(JoinerInner::Handle(handle)))),
+            handle: handle.map(|handle| Mutex::new(JoinerInner::Handle(handle))),
         }
     }
 

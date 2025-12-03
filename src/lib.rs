@@ -109,11 +109,15 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// # }
 pub struct AsyncPgConnection {
     conn: Arc<Client>,
-    stmt_cache: Arc<Mutex<StatementCache<diesel::pg::Pg, StatementGuarded>>>,
-    metadata_cache: Arc<Mutex<PgMetadataCache>>,
-    error_joiner: ErrorJoiner,
+    cache: Arc<Cache>,
     // a sync mutex is fine here as we only hold it for a really short time
     instrumentation: Arc<std::sync::Mutex<dyn Instrumentation>>,
+}
+
+struct Cache {
+    stmt: Mutex<StatementCache<diesel::pg::Pg, StatementGuarded>>,
+    meta: Mutex<PgMetadataCache>,
+    error_joiner: ErrorJoiner,
 }
 
 impl SimpleAsyncConnection for AsyncPgConnection {
@@ -132,7 +136,7 @@ impl SimpleAsyncConnection for &AsyncPgConnection {
 
         let res = match query.execute(&self.conn).await {
             Ok(_) => Ok(()),
-            Err(e) => Err(self.error_joiner.join(e).await),
+            Err(e) => Err(self.cache.error_joiner.join(e).await),
         };
 
         self.record_instrumentation(InstrumentationEvent::finish_query(
@@ -269,8 +273,8 @@ impl AsyncConnection for AsyncPgConnection {
         // there should be no other pending future when this is called
         // that means there is only one instance of this arc and
         // we can simply access the inner data
-        if let Some(cache) = Arc::get_mut(&mut self.stmt_cache) {
-            cache.get_mut().set_cache_size(size)
+        if let Some(cache) = Arc::get_mut(&mut self.cache) {
+            cache.stmt.get_mut().set_cache_size(size)
         } else {
             panic!("Cannot access shared statement cache")
         }
@@ -362,9 +366,11 @@ impl AsyncPgConnection {
     ) -> ConnectionResult<Self> {
         let mut conn = Self {
             conn: Arc::new(conn),
-            stmt_cache: Arc::new(Mutex::new(StatementCache::new())),
-            metadata_cache: Arc::new(Mutex::new(PgMetadataCache::new())),
-            error_joiner,
+            cache: Arc::new(Cache {
+                stmt: Mutex::new(StatementCache::new()),
+                meta: Mutex::new(PgMetadataCache::new()),
+                error_joiner,
+            }),
             instrumentation,
         };
         conn.set_config_options()
@@ -440,9 +446,7 @@ impl AsyncPgConnection {
         R: Send,
     {
         let raw_connection = self.conn.clone();
-        let stmt_cache = self.stmt_cache.clone();
-        let metadata_cache = self.metadata_cache.clone();
-        let error_joiner = self.error_joiner.clone();
+        let cache = self.cache.clone();
 
         #[cfg(feature = "instrumentation")]
         let instrumentation = self.instrumentation.clone();
@@ -464,7 +468,7 @@ impl AsyncPgConnection {
             // If the user doesn't use custom types there is no need
             // to bother with that at all
             if let Some(ref unresolved_types) = generated_oids {
-                let metadata_cache = &mut *metadata_cache.lock().await;
+                let metadata_cache = &mut *cache.meta.lock().await;
                 let mut real_oids = HashMap::new();
 
                 for ((schema, lookup_type_name), (fake_oid, fake_array_oid)) in unresolved_types {
@@ -520,7 +524,8 @@ impl AsyncPgConnection {
                 safe_to_cache: is_safe_to_cache_prepared,
             };
 
-            let stmt = match stmt_cache
+            let stmt = match cache
+                .stmt
                 .lock()
                 .await
                 .cached_statement_non_generic(
@@ -557,7 +562,7 @@ impl AsyncPgConnection {
 
             let res = match callback(stmt, binds).await {
                 Ok(res) => Ok(res),
-                Err(e) => Err(error_joiner.join(e).await),
+                Err(e) => Err(cache.error_joiner.join(e).await),
             };
 
             #[cfg(feature = "instrumentation")]
