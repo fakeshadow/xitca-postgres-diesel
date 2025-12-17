@@ -126,6 +126,7 @@ impl SimpleAsyncConnection for AsyncPgConnection {
 impl SimpleAsyncConnection for &AsyncPgConnection {
     #[inline]
     async fn batch_execute(&mut self, query: &str) -> QueryResult<()> {
+        #[cfg(feature = "instrumentation")]
         self.record_instrumentation(InstrumentationEvent::start_query(&StrQueryHelper::new(
             query,
         )));
@@ -135,6 +136,7 @@ impl SimpleAsyncConnection for &AsyncPgConnection {
             Err(e) => Err(self.cache.error_joiner.join(e).await),
         };
 
+        #[cfg(feature = "instrumentation")]
         self.record_instrumentation(InstrumentationEvent::finish_query(
             &StrQueryHelper::new(query),
             res.as_ref().err(),
