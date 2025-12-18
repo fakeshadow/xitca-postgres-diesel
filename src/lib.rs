@@ -46,7 +46,7 @@ use tokio::sync::Mutex;
 use xitca_postgres::{
     Client, Execute,
     iter::AsyncLendingIterator,
-    statement::{Statement, StatementUnnamed},
+    statement::{Statement, StatementNamed},
     types::Type,
 };
 
@@ -755,7 +755,7 @@ where
     }
 }
 
-const LOOK_UP: StatementUnnamed = Statement::unnamed(
+const LOOK_UP: StatementNamed<'_> = Statement::unnamed(
     "SELECT pg_type.oid, pg_type.typarray FROM pg_type \
     INNER JOIN pg_namespace ON pg_type.typnamespace = pg_namespace.oid \
     WHERE pg_type.typname = $1 AND pg_namespace.nspname = $2 \
@@ -763,7 +763,7 @@ const LOOK_UP: StatementUnnamed = Statement::unnamed(
     &[],
 );
 
-const LOOK_UP_NO_SCHEMA: StatementUnnamed = Statement::unnamed(
+const LOOK_UP_NO_SCHEMA: StatementNamed<'_> = Statement::unnamed(
     "SELECT pg_type.oid, pg_type.typarray FROM pg_type \
     WHERE pg_type.oid = quote_ident($1)::regtype::oid \
     LIMIT 1",
