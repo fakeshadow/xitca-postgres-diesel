@@ -27,7 +27,9 @@ use std::{
 use diesel::{
     connection::{
         CacheSize, Instrumentation, InstrumentationEvent, StrQueryHelper,
-        statement_cache::{PrepareForCache, QueryFragmentForCachedStatement, StatementCache},
+        statement_cache::{
+            MaybeCached, PrepareForCache, QueryFragmentForCachedStatement, StatementCache,
+        },
     },
     pg::{
         Pg, PgMetadataCache, PgMetadataCacheKey, PgMetadataLookup, PgQueryBuilder, PgTypeMetadata,
@@ -286,11 +288,9 @@ fn load_prepared(
 ) -> impl Future<Output = Result<RowStream, xitca_postgres::Error>> + Send + use<> {
     let res = stmt
         .bind(binds.map(|(a, b)| ToSqlHelper(a, b)))
-        .query(cli)
-        .into_inner()
-        .map(RowStream::from);
-
-    async { res }
+        .into_owned()
+        .query(cli);
+    async { res.await.map(RowStream::from) }
 }
 
 fn execute_prepared(
@@ -559,7 +559,16 @@ impl AsyncPgConnection {
                         .into_iter()
                         .zip(bind_collector.binds);
 
-                    callback(&*stmt, &cli, binds)
+                    match stmt {
+                        MaybeCached::CannotCache(stmt) => {
+                            // it's important to reconstruct the statement guard when the statement is not cached
+                            // the guard is tasked with cancel the statement object from db server after the query is done
+                            let stmt = stmt.into_guarded(&cli);
+                            callback(&stmt, &cli, binds)
+                        }
+                        MaybeCached::Cached(stmt) => callback(stmt, &cli, binds),
+                        _ => unreachable!(),
+                    }
                 })?;
 
             let res = match res.await {
@@ -755,7 +764,7 @@ where
     }
 }
 
-const LOOK_UP: StatementNamed<'_> = Statement::unnamed(
+const LOOK_UP: StatementNamed<'_> = Statement::named(
     "SELECT pg_type.oid, pg_type.typarray FROM pg_type \
     INNER JOIN pg_namespace ON pg_type.typnamespace = pg_namespace.oid \
     WHERE pg_type.typname = $1 AND pg_namespace.nspname = $2 \
@@ -763,7 +772,7 @@ const LOOK_UP: StatementNamed<'_> = Statement::unnamed(
     &[],
 );
 
-const LOOK_UP_NO_SCHEMA: StatementNamed<'_> = Statement::unnamed(
+const LOOK_UP_NO_SCHEMA: StatementNamed<'_> = Statement::named(
     "SELECT pg_type.oid, pg_type.typarray FROM pg_type \
     WHERE pg_type.oid = quote_ident($1)::regtype::oid \
     LIMIT 1",

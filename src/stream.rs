@@ -13,11 +13,9 @@ pub struct RowStream {
     stream: RowStreamOwned,
 }
 
-impl From<xitca_postgres::RowStream<'_>> for RowStream {
-    fn from(stream: xitca_postgres::RowStream<'_>) -> Self {
-        Self {
-            stream: RowStreamOwned::from(stream),
-        }
+impl From<RowStreamOwned> for RowStream {
+    fn from(stream: RowStreamOwned) -> Self {
+        Self { stream }
     }
 }
 
