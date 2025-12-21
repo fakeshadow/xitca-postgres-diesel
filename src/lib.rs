@@ -118,6 +118,16 @@ struct Cache {
     instrumentation: Mutex<Option<Box<dyn Instrumentation>>>,
 }
 
+impl Cache {
+    fn record_instrumentation(&self, _event: InstrumentationEvent<'_>) {
+        #[cfg(feature = "instrumentation")]
+        self.instrumentation
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .on_connection_event(_event);
+    }
+}
+
 impl SimpleAsyncConnection for AsyncPgConnection {
     #[inline]
     async fn batch_execute(&mut self, query: &str) -> QueryResult<()> {
@@ -128,7 +138,6 @@ impl SimpleAsyncConnection for AsyncPgConnection {
 impl SimpleAsyncConnection for &AsyncPgConnection {
     #[inline]
     async fn batch_execute(&mut self, query: &str) -> QueryResult<()> {
-        #[cfg(feature = "instrumentation")]
         self.record_instrumentation(InstrumentationEvent::start_query(&StrQueryHelper::new(
             query,
         )));
@@ -138,7 +147,6 @@ impl SimpleAsyncConnection for &AsyncPgConnection {
             Err(e) => Err(self.cache.error_joiner.join(e).await),
         };
 
-        #[cfg(feature = "instrumentation")]
         self.record_instrumentation(InstrumentationEvent::finish_query(
             &StrQueryHelper::new(query),
             res.as_ref().err(),
@@ -207,9 +215,14 @@ impl AsyncConnection for AsyncPgConnection {
 
     async fn establish(database_url: &str) -> ConnectionResult<Self> {
         let mut instrumentation = diesel::connection::get_default_instrumentation();
+
+        #[cfg(feature = "instrumentation")]
         instrumentation.on_connection_event(InstrumentationEvent::start_establish_connection(
             database_url,
         ));
+
+        let _ = &mut instrumentation;
+
         let instrumentation = std::sync::Mutex::new(instrumentation);
         let (client, driver) = xitca_postgres::Postgres::new(database_url)
             .connect()
@@ -371,14 +384,10 @@ impl AsyncPgConnection {
             .map_err(ConnectionError::CouldntSetupConfiguration);
 
         if let Some(database_url) = database_url {
-            conn.cache
-                .instrumentation
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .on_connection_event(InstrumentationEvent::finish_establish_connection(
-                    database_url,
-                    res.as_ref().err(),
-                ));
+            conn.record_instrumentation(InstrumentationEvent::finish_establish_connection(
+                database_url,
+                res.as_ref().err(),
+            ));
         }
 
         Ok(conn)
@@ -408,12 +417,10 @@ impl AsyncPgConnection {
         F: Future<Output = Result<R, xitca_postgres::Error>> + Send + 'static,
         R: Send,
     {
-        #[cfg(feature = "instrumentation")]
-        {
-            self.record_instrumentation(InstrumentationEvent::start_query(&diesel::debug_query(
-                &query,
-            )));
-        }
+        self.record_instrumentation(InstrumentationEvent::start_query(&diesel::debug_query(
+            &query,
+        )));
+
         // we explicilty descruct the query here before going into the async block
         //
         // That's required to remove the send bound from `T` as we have translated
@@ -423,7 +430,7 @@ impl AsyncPgConnection {
         // so there is no need to even access the query in the async block below
         let mut query_builder = PgQueryBuilder::default();
 
-        let bind_data = construct_bind_data(&query);
+        let bind_result = construct_bind_data(&query);
 
         let to_sql = query
             .to_sql(&mut query_builder, &Pg)
@@ -435,7 +442,7 @@ impl AsyncPgConnection {
             query.is_safe_to_cache_prepared(&Pg),
             T::query_id(),
             to_sql,
-            bind_data,
+            bind_result,
         )
     }
 
@@ -445,7 +452,7 @@ impl AsyncPgConnection {
         is_safe_to_cache_prepared: QueryResult<bool>,
         query_id: Option<TypeId>,
         to_sql: QueryResult<String>,
-        bind_data: BindData,
+        bind_result: Result<BindData, Error>,
     ) -> BoxFuture<'static, QueryResult<R>>
     where
         C: FnOnce(&Statement, &Client, Binds) -> F + Send + 'static,
@@ -455,67 +462,15 @@ impl AsyncPgConnection {
         let raw_connection = self.conn.clone();
         let cache = self.cache.clone();
 
-        let BindData {
-            collect_bind_result,
-            fake_oid_locations,
-            generated_oids,
-            mut bind_collector,
-        } = bind_data;
-
         Box::pin(async move {
             let sql = to_sql?;
             let is_safe_to_cache_prepared = is_safe_to_cache_prepared?;
-            collect_bind_result?;
 
             // Check whether we need to resolve some types at all
             //
             // If the user doesn't use custom types there is no need
             // to bother with that at all
-            if let Some(ref unresolved_types) = generated_oids {
-                let metadata_cache = &mut *cache.meta.lock().await;
-                let mut real_oids = HashMap::new();
-
-                for ((schema, lookup_type_name), (fake_oid, fake_array_oid)) in unresolved_types {
-                    // for each unresolved item
-                    // we check whether it's already in the cache
-                    // or perform a lookup and insert it into the cache
-                    let cache_key = PgMetadataCacheKey::new(
-                        schema.as_deref().map(Into::into),
-                        lookup_type_name.into(),
-                    );
-                    let real_metadata =
-                        if let Some(type_metadata) = metadata_cache.lookup_type(&cache_key) {
-                            type_metadata
-                        } else {
-                            let type_metadata =
-                                lookup_type(schema, lookup_type_name, &raw_connection).await?;
-                            metadata_cache.store_type(cache_key, type_metadata);
-
-                            PgTypeMetadata::from_result(Ok(type_metadata))
-                        };
-                    // let (fake_oid, fake_array_oid) = metadata_lookup.fake_oids(index);
-                    let (real_oid, real_array_oid) = unwrap_oids(&real_metadata);
-                    real_oids.extend([(*fake_oid, real_oid), (*fake_array_oid, real_array_oid)]);
-                }
-
-                // Replace fake OIDs with real OIDs in `bind_collector.metadata`
-                for m in &mut bind_collector.metadata {
-                    let (oid, array_oid) = unwrap_oids(m);
-                    *m = PgTypeMetadata::new(
-                        real_oids.get(&oid).copied().unwrap_or(oid),
-                        real_oids.get(&array_oid).copied().unwrap_or(array_oid),
-                    );
-                }
-                // Replace fake OIDs with real OIDs in `bind_collector.binds`
-                for (bind_index, byte_index) in fake_oid_locations {
-                    replace_fake_oid(
-                        &mut bind_collector.binds,
-                        &real_oids,
-                        bind_index,
-                        byte_index,
-                    )?;
-                }
-            }
+            let bind_collector = bind_result?.type_resolver(&raw_connection, &cache).await?;
 
             #[cfg(feature = "instrumentation")]
             let cache_clone = cache.clone();
@@ -541,11 +496,7 @@ impl AsyncPgConnection {
                         {
                             // we wrap this lock into another callback to prevent locking
                             // the instrumentation longer than necessary
-                            cache_clone
-                                .instrumentation
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .on_connection_event(_event);
+                            cache_clone.record_instrumentation(_event);
                         }
                     },
                 )
@@ -573,39 +524,89 @@ impl AsyncPgConnection {
                 Err(e) => Err(cache.error_joiner.join(e).await),
             };
 
-            #[cfg(feature = "instrumentation")]
-            {
-                cache
-                    .instrumentation
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .on_connection_event(InstrumentationEvent::finish_query(
-                        &StrQueryHelper::new(&sql),
-                        res.as_ref().err(),
-                    ));
-            }
+            cache.record_instrumentation(InstrumentationEvent::finish_query(
+                &StrQueryHelper::new(&sql),
+                res.as_ref().err(),
+            ));
 
             res
         })
     }
 
     fn record_instrumentation(&self, event: InstrumentationEvent<'_>) {
-        self.cache
-            .instrumentation
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .on_connection_event(event);
+        self.cache.record_instrumentation(event);
     }
 }
 
 struct BindData {
-    collect_bind_result: Result<(), Error>,
     fake_oid_locations: Vec<(usize, usize)>,
     generated_oids: GeneratedOidTypeMap,
     bind_collector: RawBytesBindCollector<Pg>,
 }
 
-fn construct_bind_data(query: &dyn QueryFragment<Pg>) -> BindData {
+impl BindData {
+    async fn type_resolver(
+        self,
+        conn: &Client,
+        cache: &Cache,
+    ) -> Result<RawBytesBindCollector<Pg>, Error> {
+        let Self {
+            fake_oid_locations,
+            generated_oids,
+            mut bind_collector,
+        } = self;
+
+        if let Some(ref unresolved_types) = generated_oids {
+            let metadata_cache = &mut *cache.meta.lock().await;
+            let mut real_oids = HashMap::new();
+
+            for ((schema, lookup_type_name), (fake_oid, fake_array_oid)) in unresolved_types {
+                // for each unresolved item
+                // we check whether it's already in the cache
+                // or perform a lookup and insert it into the cache
+                let cache_key = PgMetadataCacheKey::new(
+                    schema.as_deref().map(Into::into),
+                    lookup_type_name.into(),
+                );
+                let real_metadata =
+                    if let Some(type_metadata) = metadata_cache.lookup_type(&cache_key) {
+                        type_metadata
+                    } else {
+                        let type_metadata = lookup_type(schema, lookup_type_name, conn).await?;
+                        metadata_cache.store_type(cache_key, type_metadata);
+
+                        PgTypeMetadata::from_result(Ok(type_metadata))
+                    };
+                // let (fake_oid, fake_array_oid) = metadata_lookup.fake_oids(index);
+                let (real_oid, real_array_oid) = unwrap_oids(&real_metadata);
+                real_oids.extend([(*fake_oid, real_oid), (*fake_array_oid, real_array_oid)]);
+            }
+
+            // Replace fake OIDs with real OIDs in `bind_collector.metadata`
+            for m in &mut bind_collector.metadata {
+                let (oid, array_oid) = unwrap_oids(m);
+                *m = PgTypeMetadata::new(
+                    real_oids.get(&oid).copied().unwrap_or(oid),
+                    real_oids.get(&array_oid).copied().unwrap_or(array_oid),
+                );
+            }
+
+            // Replace fake OIDs with real OIDs in `bind_collector.binds`
+            for (bind_index, byte_index) in fake_oid_locations {
+                replace_fake_oid(
+                    &mut bind_collector.binds,
+                    &real_oids,
+                    bind_index,
+                    byte_index,
+                )?;
+            }
+        }
+
+        Ok(bind_collector)
+    }
+}
+
+fn construct_bind_data(query: &dyn QueryFragment<Pg>) -> Result<BindData, Error> {
     // we don't resolve custom types here yet, we do that later
     // in the async block below as we might need to perform lookup
     // queries for that.
@@ -719,19 +720,20 @@ fn construct_bind_data(query: &dyn QueryFragment<Pg>) -> BindData {
         })
         // Avoid storing the bind collectors in the returned Future
         .collect();
-        BindData {
-            collect_bind_result: collect_bind_result_0.and(collect_bind_result_1),
-            fake_oid_locations,
-            generated_oids: metadata_lookup_1.generated_oids,
-            bind_collector: bind_collector_1,
-        }
+
+        collect_bind_result_0
+            .and(collect_bind_result_1)
+            .map(|_| BindData {
+                fake_oid_locations,
+                generated_oids: metadata_lookup_1.generated_oids,
+                bind_collector: bind_collector_1,
+            })
     } else {
-        BindData {
-            collect_bind_result: collect_bind_result_0,
+        collect_bind_result_0.map(|_| BindData {
             fake_oid_locations: Vec::new(),
             generated_oids: None,
             bind_collector: bind_collector_0,
-        }
+        })
     }
 }
 
