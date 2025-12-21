@@ -20,7 +20,7 @@ use core::{
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, Mutex},
     vec::IntoIter,
 };
 
@@ -44,7 +44,7 @@ use diesel_async::{
     pooled_connection::PoolableConnection,
 };
 use scoped_futures::ScopedBoxFuture;
-use tokio::sync::Mutex;
+use tokio::sync::Mutex as AsyncMutex;
 use xitca_postgres::{
     Client, Execute,
     iter::AsyncLendingIterator,
@@ -108,14 +108,14 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub struct AsyncPgConnection {
     conn: Arc<Client>,
     cache: Arc<Cache>,
-    // a sync mutex is fine here as we only hold it for a really short time
-    instrumentation: Arc<std::sync::Mutex<dyn Instrumentation>>,
 }
 
 struct Cache {
-    stmt: Mutex<StatementCache<diesel::pg::Pg, Statement>>,
-    meta: Mutex<PgMetadataCache>,
+    stmt: AsyncMutex<StatementCache<diesel::pg::Pg, Statement>>,
+    meta: AsyncMutex<PgMetadataCache>,
     error_joiner: ErrorJoiner,
+    // a sync mutex is fine here as we only hold it for a really short time
+    instrumentation: Mutex<Option<Box<dyn Instrumentation>>>,
 }
 
 impl SimpleAsyncConnection for AsyncPgConnection {
@@ -210,7 +210,7 @@ impl AsyncConnection for AsyncPgConnection {
         instrumentation.on_connection_event(InstrumentationEvent::start_establish_connection(
             database_url,
         ));
-        let instrumentation = Arc::new(std::sync::Mutex::new(instrumentation)) as _;
+        let instrumentation = std::sync::Mutex::new(instrumentation);
         let (client, driver) = xitca_postgres::Postgres::new(database_url)
             .connect()
             .await
@@ -218,20 +218,13 @@ impl AsyncConnection for AsyncPgConnection {
 
         let handle = tokio::spawn(driver.into_future());
 
-        let r = Self::setup(
+        Self::setup(
             client,
+            Some(database_url),
             ErrorJoiner::new(Some(handle)),
-            Arc::clone(&instrumentation),
+            instrumentation,
         )
-        .await;
-        instrumentation
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .on_connection_event(InstrumentationEvent::finish_establish_connection(
-                database_url,
-                r.as_ref().err(),
-            ));
-        r
+        .await
     }
 
     fn transaction<'a, 'conn, R, E, F>(&'conn mut self, _: F) -> BoxFuture<'conn, Result<R, E>>
@@ -252,14 +245,17 @@ impl AsyncConnection for AsyncPgConnection {
         // there should be no other pending future when this is called
         // that means there is only one instance of this arc and
         // we can simply access the inner data
-        Arc::get_mut(&mut self.instrumentation)
+        Arc::get_mut(&mut self.cache)
             .expect("Cannot access shared instrumentation")
+            .instrumentation
             .get_mut()
             .unwrap_or_else(|p| p.into_inner())
     }
 
     fn set_instrumentation(&mut self, instrumentation: impl Instrumentation) {
-        self.instrumentation = Arc::new(std::sync::Mutex::new(instrumentation));
+        Arc::get_mut(&mut self.cache)
+            .expect("Cannot access shared instrumentation")
+            .instrumentation = std::sync::Mutex::new(Some(Box::new(instrumentation) as _));
     }
 
     fn set_prepared_statement_cache_size(&mut self, size: CacheSize) {
@@ -347,31 +343,44 @@ impl AsyncPgConnection {
     pub async fn try_from(conn: Client) -> ConnectionResult<Self> {
         Self::setup(
             conn,
+            None,
             ErrorJoiner::new(None),
-            Arc::new(std::sync::Mutex::new(
-                diesel::connection::get_default_instrumentation(),
-            )),
+            Mutex::new(diesel::connection::get_default_instrumentation()),
         )
         .await
     }
 
     async fn setup(
         conn: Client,
+        database_url: Option<&str>,
         error_joiner: ErrorJoiner,
-        instrumentation: Arc<std::sync::Mutex<dyn Instrumentation>>,
+        instrumentation: Mutex<Option<Box<dyn Instrumentation>>>,
     ) -> ConnectionResult<Self> {
         let mut conn = Self {
             conn: Arc::new(conn),
             cache: Arc::new(Cache {
-                stmt: Mutex::new(StatementCache::new()),
-                meta: Mutex::new(PgMetadataCache::new()),
+                stmt: AsyncMutex::new(StatementCache::new()),
+                meta: AsyncMutex::new(PgMetadataCache::new()),
                 error_joiner,
+                instrumentation,
             }),
-            instrumentation,
         };
-        conn.set_config_options()
+        let res = conn
+            .set_config_options()
             .await
-            .map_err(ConnectionError::CouldntSetupConfiguration)?;
+            .map_err(ConnectionError::CouldntSetupConfiguration);
+
+        if let Some(database_url) = database_url {
+            conn.cache
+                .instrumentation
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .on_connection_event(InstrumentationEvent::finish_establish_connection(
+                    database_url,
+                    res.as_ref().err(),
+                ));
+        }
+
         Ok(conn)
     }
 
@@ -446,9 +455,6 @@ impl AsyncPgConnection {
         let raw_connection = self.conn.clone();
         let cache = self.cache.clone();
 
-        #[cfg(feature = "instrumentation")]
-        let instrumentation = self.instrumentation.clone();
-
         let BindData {
             collect_bind_result,
             fake_oid_locations,
@@ -512,7 +518,7 @@ impl AsyncPgConnection {
             }
 
             #[cfg(feature = "instrumentation")]
-            let instrument = instrumentation.clone();
+            let cache_clone = cache.clone();
 
             let source = QueryFragmentHelper {
                 sql: &sql,
@@ -535,7 +541,8 @@ impl AsyncPgConnection {
                         {
                             // we wrap this lock into another callback to prevent locking
                             // the instrumentation longer than necessary
-                            instrument
+                            cache_clone
+                                .instrumentation
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
                                 .on_connection_event(_event);
@@ -568,7 +575,8 @@ impl AsyncPgConnection {
 
             #[cfg(feature = "instrumentation")]
             {
-                instrumentation
+                cache
+                    .instrumentation
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .on_connection_event(InstrumentationEvent::finish_query(
@@ -582,7 +590,8 @@ impl AsyncPgConnection {
     }
 
     fn record_instrumentation(&self, event: InstrumentationEvent<'_>) {
-        self.instrumentation
+        self.cache
+            .instrumentation
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .on_connection_event(event);
