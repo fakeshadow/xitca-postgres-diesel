@@ -216,14 +216,7 @@ impl AsyncConnection for AsyncPgConnection {
             .await
             .map_err(error::into_connection_error)?;
 
-        let handle = tokio::spawn(async move {
-            driver
-                .into_future()
-                .await
-                // TODO: diesel async should be treat driver graceful shutdown as non error.
-                .err()
-                .unwrap_or_else(|| xitca_postgres::error::DriverDown.into())
-        });
+        let handle = tokio::spawn(driver.into_future());
 
         let r = Self::setup(
             client,
@@ -522,10 +515,7 @@ impl AsyncPgConnection {
             let instrument = instrumentation.clone();
 
             let source = QueryFragmentHelper {
-                #[cfg(feature = "instrumentation")]
-                sql: sql.clone(),
-                #[cfg(not(feature = "instrumentation"))]
-                sql,
+                sql: &sql,
                 safe_to_cache: is_safe_to_cache_prepared,
             };
 
@@ -837,9 +827,9 @@ impl PoolableConnection for AsyncPgConnection {
     }
 }
 
-impl QueryFragmentForCachedStatement<Pg> for QueryFragmentHelper {
+impl QueryFragmentForCachedStatement<Pg> for QueryFragmentHelper<'_> {
     fn construct_sql(&self, _backend: &Pg) -> QueryResult<String> {
-        Ok(self.sql.clone())
+        Ok(self.sql.to_string())
     }
 
     fn is_safe_to_cache_prepared(&self, _backend: &Pg) -> QueryResult<bool> {
