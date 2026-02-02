@@ -1,309 +1,328 @@
 //! diesel-async api powered by xitca-postgres db driver
 
-#[doc(hidden)]
-pub mod pool;
-
-mod cache;
 mod error;
 mod row;
 mod serialize;
-mod stream;
 mod transaction_builder;
 mod transaction_manager;
 
-use core::{
-    any::TypeId,
-    future::{Future, IntoFuture},
-    iter::Zip,
-    pin::Pin,
-};
+use core::future::Future;
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::{Arc, Mutex},
-    vec::IntoIter,
-};
+use std::collections::{HashMap, HashSet};
 
 use diesel::{
-    connection::{
-        CacheSize, Instrumentation, InstrumentationEvent, StrQueryHelper,
-        statement_cache::{
-            MaybeCached, PrepareForCache, QueryFragmentForCachedStatement, StatementCache,
-        },
-    },
+    ConnectionError,
+    deserialize::FromSqlRow,
     pg::{
         Pg, PgMetadataCache, PgMetadataCacheKey, PgMetadataLookup, PgQueryBuilder, PgTypeMetadata,
     },
     query_builder::{
         AsQuery, QueryBuilder, QueryFragment, QueryId, bind_collector::RawBytesBindCollector,
     },
-    result::{ConnectionError, ConnectionResult, Error, QueryResult},
+    result::{Error, QueryResult},
 };
-use diesel_async::{
-    AsyncConnection, AsyncConnectionCore, SimpleAsyncConnection,
-    pooled_connection::PoolableConnection,
-};
-use scoped_futures::ScopedBoxFuture;
 use tokio::sync::Mutex as AsyncMutex;
 use xitca_postgres::{
-    Client, Execute,
+    Execute, RowStreamOwned,
     iter::AsyncLendingIterator,
+    pool::{CachedStatement, Pool, PoolConnection},
     statement::{Statement, StatementNamed},
     types::Type,
 };
 
-use self::{
-    cache::{CallbackHelper, QueryFragmentHelper},
-    error::ErrorJoiner,
-    row::PgRow,
-    serialize::ToSqlHelper,
-    stream::RowStream,
-    transaction_manager::AnsiTransactionManager,
-};
+use self::{row::PgRow, serialize::ToSqlHelper};
 
 pub use transaction_builder::TransactionBuilder;
 
 const FAKE_OID: u32 = 0;
 
-type Binds = Zip<IntoIter<PgTypeMetadata>, IntoIter<Option<Vec<u8>>>>;
-
-type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
-
-/// A connection to a PostgreSQL database.
-///
-/// Connection URLs should be in the form
-/// `postgres://[user[:password]@]host/database_name`
-///
-/// Checkout the documentation of the [xitca-postgres] crate for details about the format
-///
-/// [xitca-postgres]: https://github.com/HFQR/xitca-web/postgres
-///
-/// ```rust
-/// # include!("./doc_test.rs");
-/// use diesel_async::RunQueryDsl;
-///
-/// #
-/// # #[tokio::main(flavor = "current_thread")]
-/// # async fn main() {
-/// #     run_test().await.unwrap();
-/// # }
-/// #
-/// # async fn run_test() -> QueryResult<()> {
-/// #     use diesel::sql_types::{Text, Integer};
-/// #     let conn = &mut establish_connection().await;
-///       let q1 = diesel::select(1_i32.into_sql::<Integer>());
-///       let q2 = diesel::select(2_i32.into_sql::<Integer>());
-///
-///       // construct multiple futures for different queries
-///       let f1 = q1.get_result::<i32>(conn);
-///       let f2 = q2.get_result::<i32>(conn);
-///
-///       // wait on both results
-///       let res = futures_util::try_join!(f1, f2)?;
-///
-///       assert_eq!(res.0, 1);
-///       assert_eq!(res.1, 2);
-///       # Ok(())
-/// # }
 pub struct AsyncPgConnection {
-    conn: Arc<Client>,
-    cache: Arc<Cache>,
+    pool: Pool,
+    meta: Meta,
 }
 
-struct Cache {
-    stmt: AsyncMutex<StatementCache<diesel::pg::Pg, Statement>>,
-    meta: AsyncMutex<PgMetadataCache>,
-    error_joiner: ErrorJoiner,
-    // a sync mutex is fine here as we only hold it for a really short time
-    instrumentation: Mutex<Option<Box<dyn Instrumentation>>>,
-}
+type Meta = AsyncMutex<PgMetadataCache>;
 
-impl Cache {
-    fn record_instrumentation(&self, _event: InstrumentationEvent<'_>) {
-        #[cfg(feature = "instrumentation")]
-        self.instrumentation
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .on_connection_event(_event);
-    }
-}
-
-impl SimpleAsyncConnection for AsyncPgConnection {
-    #[inline]
-    async fn batch_execute(&mut self, query: &str) -> QueryResult<()> {
-        SimpleAsyncConnection::batch_execute(&mut &*self, query).await
-    }
-}
-
-impl SimpleAsyncConnection for &AsyncPgConnection {
-    #[inline]
-    async fn batch_execute(&mut self, query: &str) -> QueryResult<()> {
-        self.record_instrumentation(InstrumentationEvent::start_query(&StrQueryHelper::new(
-            query,
-        )));
-
-        let res = match query.execute(&self.conn).await {
-            Ok(_) => Ok(()),
-            Err(e) => Err(self.cache.error_joiner.join(e).await),
-        };
-
-        self.record_instrumentation(InstrumentationEvent::finish_query(
-            &StrQueryHelper::new(query),
-            res.as_ref().err(),
-        ));
-
-        res
-    }
-}
-
-impl AsyncConnectionCore for AsyncPgConnection {
-    type LoadFuture<'conn, 'query> = BoxFuture<'query, QueryResult<Self::Stream<'conn, 'query>>>;
-    type ExecuteFuture<'conn, 'query> = BoxFuture<'query, QueryResult<usize>>;
-    type Stream<'conn, 'query> = RowStream;
-    type Row<'conn, 'query> = PgRow;
-    type Backend = diesel::pg::Pg;
-
-    fn load<'conn, 'query, T>(&'conn mut self, source: T) -> Self::LoadFuture<'conn, 'query>
-    where
-        T: AsQuery + 'query,
-        T::Query: QueryFragment<Self::Backend> + QueryId + 'query,
-    {
-        AsyncConnectionCore::load(&mut &*self, source)
-    }
-
-    fn execute_returning_count<'conn, 'query, T>(
-        &'conn mut self,
-        source: T,
-    ) -> Self::ExecuteFuture<'conn, 'query>
-    where
-        T: QueryFragment<Self::Backend> + QueryId + 'query,
-    {
-        AsyncConnectionCore::execute_returning_count(&mut &*self, source)
-    }
-}
-
-impl AsyncConnectionCore for &AsyncPgConnection {
-    type LoadFuture<'conn, 'query> =
-        <AsyncPgConnection as AsyncConnectionCore>::LoadFuture<'conn, 'query>;
-    type ExecuteFuture<'conn, 'query> =
-        <AsyncPgConnection as AsyncConnectionCore>::ExecuteFuture<'conn, 'query>;
-    type Stream<'conn, 'query> = <AsyncPgConnection as AsyncConnectionCore>::Stream<'conn, 'query>;
-    type Row<'conn, 'query> = <AsyncPgConnection as AsyncConnectionCore>::Row<'conn, 'query>;
-    type Backend = <AsyncPgConnection as AsyncConnectionCore>::Backend;
-
-    fn load<'conn, 'query, T>(&'conn mut self, source: T) -> Self::LoadFuture<'conn, 'query>
-    where
-        T: AsQuery + 'query,
-        T::Query: QueryFragment<Self::Backend> + QueryId + 'query,
-    {
-        self.with_prepared_statement(source.as_query(), load_prepared)
-    }
-
-    fn execute_returning_count<'conn, 'query, T>(
-        &'conn mut self,
-        source: T,
-    ) -> Self::ExecuteFuture<'conn, 'query>
-    where
-        T: QueryFragment<Self::Backend> + QueryId + 'query,
-    {
-        self.with_prepared_statement(source, execute_prepared)
-    }
-}
-
-impl AsyncConnection for AsyncPgConnection {
-    type TransactionManager = AnsiTransactionManager;
-
-    async fn establish(database_url: &str) -> ConnectionResult<Self> {
-        let mut instrumentation = diesel::connection::get_default_instrumentation();
-
-        #[cfg(feature = "instrumentation")]
-        instrumentation.on_connection_event(InstrumentationEvent::start_establish_connection(
-            database_url,
-        ));
-
-        let _ = &mut instrumentation;
-
-        let instrumentation = std::sync::Mutex::new(instrumentation);
-        let (client, driver) = xitca_postgres::Postgres::new(database_url)
-            .connect()
-            .await
+impl AsyncPgConnection {
+    pub fn establish(url: &str) -> Result<Self, ConnectionError> {
+        let pool = Pool::builder(url)
+            .build()
             .map_err(error::into_connection_error)?;
 
-        let handle = tokio::spawn(driver.into_future());
-
-        Self::setup(
-            client,
-            Some(database_url),
-            ErrorJoiner::new(Some(handle)),
-            instrumentation,
-        )
-        .await
+        Ok(Self {
+            pool,
+            meta: Default::default(),
+        })
     }
+}
 
-    fn transaction<'a, 'conn, R, E, F>(&'conn mut self, _: F) -> BoxFuture<'conn, Result<R, E>>
+pub trait RunQueryDsl<C>
+where
+    Self: AsQuery + Send,
+    Self::Query: QueryFragment<Pg> + QueryId + Send,
+{
+    fn execute(self, conn: C) -> impl Future<Output = QueryResult<usize>> + Send;
+
+    fn get_result<U>(self, conn: C) -> impl Future<Output = QueryResult<U>> + Send
     where
-        F: for<'r> FnOnce(&'r mut Self) -> ScopedBoxFuture<'a, 'r, Result<R, E>> + Send + 'a,
-        E: From<diesel::result::Error> + Send + 'a,
-        R: Send + 'a,
-        'a: 'conn,
+        U: FromSqlRow<Self::SqlType, Pg> + Send;
+
+    fn load<U>(self, conn: C) -> impl Future<Output = QueryResult<Vec<U>>> + Send
+    where
+        U: FromSqlRow<Self::SqlType, Pg> + Send;
+}
+
+impl<Q> RunQueryDsl<&AsyncPgConnection> for Q
+where
+    Q: AsQuery + Send,
+    Q::Query: QueryFragment<Pg> + QueryId + Send,
+{
+    async fn execute(self, conn: &AsyncPgConnection) -> QueryResult<usize> {
+        let res = {
+            let mut pool_conn = conn.pool.get().await.map_err(error::into_error)?;
+            execute(self, &mut pool_conn, &conn.meta).await?
+        }
+        .await
+        .map_err(error::into_error)?;
+
+        Ok(res as _)
+    }
+
+    async fn get_result<U>(self, conn: &AsyncPgConnection) -> QueryResult<U>
+    where
+        U: FromSqlRow<Self::SqlType, Pg> + Send,
     {
-        unimplemented!("transaction is temporary disabled")
+        let stream = {
+            let mut pool_conn = conn.pool.get().await.map_err(error::into_error)?;
+            load(self, &mut pool_conn, &conn.meta).await?
+        };
+        try_next(stream).await
     }
 
-    fn transaction_state(&mut self) -> &mut AnsiTransactionManager {
-        unimplemented!("AsyncPgConnection does not contain transaction state")
+    async fn load<U>(self, conn: &AsyncPgConnection) -> QueryResult<Vec<U>>
+    where
+        U: FromSqlRow<Q::SqlType, Pg> + Send,
+    {
+        let stream = {
+            let mut pool_conn = conn.pool.get().await.map_err(error::into_error)?;
+            load(self, &mut pool_conn, &conn.meta).await?
+        };
+        try_collect(stream).await
+    }
+}
+
+pub struct TransactionConnection<'a> {
+    conn: PoolConnection<'a>,
+    meta: &'a Meta,
+}
+
+impl<Q> RunQueryDsl<&mut TransactionConnection<'_>> for Q
+where
+    Q: AsQuery + Send,
+    Q::Query: QueryFragment<Pg> + QueryId + Send,
+{
+    async fn execute(self, conn: &mut TransactionConnection<'_>) -> QueryResult<usize> {
+        let res = execute(self, &mut conn.conn, &conn.meta)
+            .await?
+            .await
+            .map_err(error::into_error)?;
+        Ok(res as _)
     }
 
-    fn instrumentation(&mut self) -> &mut dyn Instrumentation {
-        // there should be no other pending future when this is called
-        // that means there is only one instance of this arc and
-        // we can simply access the inner data
-        Arc::get_mut(&mut self.cache)
-            .expect("Cannot access shared instrumentation")
-            .instrumentation
-            .get_mut()
-            .unwrap_or_else(|p| p.into_inner())
+    async fn get_result<U>(self, conn: &mut TransactionConnection<'_>) -> QueryResult<U>
+    where
+        U: FromSqlRow<Self::SqlType, Pg> + Send,
+    {
+        let stream = load(self, &mut conn.conn, &conn.meta).await?;
+        try_next(stream).await
     }
 
-    fn set_instrumentation(&mut self, instrumentation: impl Instrumentation) {
-        Arc::get_mut(&mut self.cache)
-            .expect("Cannot access shared instrumentation")
-            .instrumentation = std::sync::Mutex::new(Some(Box::new(instrumentation) as _));
+    async fn load<U>(self, conn: &mut TransactionConnection<'_>) -> QueryResult<Vec<U>>
+    where
+        U: FromSqlRow<Q::SqlType, Pg> + Send,
+    {
+        let stream = load(self, &mut conn.conn, &conn.meta).await?;
+        try_collect(stream).await
     }
+}
 
-    fn set_prepared_statement_cache_size(&mut self, size: CacheSize) {
-        // there should be no other pending future when this is called
-        // that means there is only one instance of this arc and
-        // we can simply access the inner data
-        if let Some(cache) = Arc::get_mut(&mut self.cache) {
-            cache.stmt.get_mut().set_cache_size(size)
-        } else {
-            panic!("Cannot access shared statement cache")
+async fn execute<Q>(
+    query: Q,
+    conn: &mut PoolConnection<'_>,
+    meta: &Meta,
+) -> QueryResult<impl Future<Output = Result<u64, xitca_postgres::Error>> + 'static>
+where
+    Q: AsQuery + Send,
+    Q::Query: QueryFragment<Pg> + QueryId + Send,
+{
+    execute_with(query, conn, meta, async |conn, stmt, bind_collector| {
+        let binds = bind_collector
+            .metadata
+            .into_iter()
+            .zip(bind_collector.binds)
+            .map(ToSqlHelper);
+
+        Ok(stmt.bind(binds).execute(&*conn))
+    })
+    .await
+}
+
+async fn load<Q>(
+    query: Q,
+    conn: &mut PoolConnection<'_>,
+    meta: &Meta,
+) -> QueryResult<RowStreamOwned>
+where
+    Q: AsQuery + Send,
+    Q::Query: QueryFragment<Pg> + QueryId + Send,
+{
+    execute_with(query, conn, meta, async |conn, stmt, bind_collector| {
+        let binds = bind_collector
+            .metadata
+            .into_iter()
+            .zip(bind_collector.binds)
+            .map(ToSqlHelper);
+
+        stmt.bind(binds)
+            .into_owned()
+            .query(&*conn)
+            .await
+            .map_err(error::into_error)
+    })
+    .await
+}
+
+async fn execute_with<Q, E, R>(
+    query: Q,
+    conn: &mut PoolConnection<'_>,
+    meta: &Meta,
+    exec: E,
+) -> QueryResult<R>
+where
+    Q: AsQuery + Send,
+    Q::Query: QueryFragment<Pg> + QueryId + Send,
+    E: AsyncFnOnce(
+        &mut PoolConnection<'_>,
+        CachedStatement,
+        RawBytesBindCollector<Pg>,
+    ) -> QueryResult<R>,
+{
+    let query = query.as_query();
+
+    let mut query_builder = PgQueryBuilder::default();
+
+    let bind_data = construct_bind_data(&query)?;
+
+    query.to_sql(&mut query_builder, &Pg)?;
+
+    let sql = query_builder.finish();
+
+    let BindData {
+        fake_oid_locations,
+        generated_oids,
+        mut bind_collector,
+    } = bind_data;
+
+    if let Some(ref unresolved_types) = generated_oids {
+        let metadata_cache = &mut *meta.lock().await;
+        let mut real_oids = HashMap::new();
+
+        for ((schema, lookup_type_name), (fake_oid, fake_array_oid)) in unresolved_types {
+            // for each unresolved item
+            // we check whether it's already in the cache
+            // or perform a lookup and insert it into the cache
+            let cache_key =
+                PgMetadataCacheKey::new(schema.as_deref().map(Into::into), lookup_type_name.into());
+            let real_metadata = if let Some(type_metadata) = metadata_cache.lookup_type(&cache_key)
+            {
+                type_metadata
+            } else {
+                let type_metadata = lookup_type(schema, lookup_type_name, conn).await?;
+                metadata_cache.store_type(cache_key, type_metadata);
+
+                PgTypeMetadata::from_result(Ok(type_metadata))
+            };
+            // let (fake_oid, fake_array_oid) = metadata_lookup.fake_oids(index);
+            let (real_oid, real_array_oid) = unwrap_oids(&real_metadata);
+            real_oids.extend([(*fake_oid, real_oid), (*fake_array_oid, real_array_oid)]);
+        }
+
+        // Replace fake OIDs with real OIDs in `bind_collector.metadata`
+        for m in &mut bind_collector.metadata {
+            let (oid, array_oid) = unwrap_oids(m);
+            *m = PgTypeMetadata::new(
+                real_oids.get(&oid).copied().unwrap_or(oid),
+                real_oids.get(&array_oid).copied().unwrap_or(array_oid),
+            );
+        }
+
+        // Replace fake OIDs with real OIDs in `bind_collector.binds`
+        for (bind_index, byte_index) in fake_oid_locations {
+            replace_fake_oid(
+                &mut bind_collector.binds,
+                &real_oids,
+                bind_index,
+                byte_index,
+            )?;
         }
     }
+
+    let bind_types = bind_collector
+        .metadata
+        .iter()
+        .map(type_from_oid)
+        .collect::<QueryResult<Vec<_>>>()?;
+
+    let stmt = xitca_postgres::Statement::named(&sql, &bind_types)
+        .execute(&mut *conn)
+        .await
+        .map_err(error::into_error)?;
+
+    exec(conn, stmt, bind_collector).await
 }
 
-fn load_prepared(
-    stmt: &Statement,
-    cli: &Client,
-    binds: Binds,
-) -> impl Future<Output = Result<RowStream, xitca_postgres::Error>> + Send + use<> {
-    let res = stmt
-        .bind(binds.map(|(a, b)| ToSqlHelper(a, b)))
-        .into_owned()
-        .query(cli);
-    async { res.await.map(RowStream::from) }
+async fn try_collect<U, St>(mut stream: RowStreamOwned) -> QueryResult<Vec<U>>
+where
+    U: FromSqlRow<St, Pg> + Send,
+{
+    let mut res = Vec::new();
+
+    while let Some(row) = stream.try_next().await.map_err(error::into_error)? {
+        let item = U::build_from_row(&PgRow::new(row)).map_err(Error::DeserializationError)?;
+        res.push(item);
+    }
+
+    Ok(res)
 }
 
-fn execute_prepared(
-    stmt: &Statement,
-    cli: &Client,
-    binds: Binds,
-) -> impl Future<Output = Result<usize, xitca_postgres::Error>> + Send + use<> {
-    let res = stmt
-        .bind(binds.map(|(a, b)| ToSqlHelper(a, b)))
-        .execute(cli);
-    async { res.await.map(|n| n as _) }
+async fn try_next<U, St>(mut stream: RowStreamOwned) -> QueryResult<U>
+where
+    U: FromSqlRow<St, Pg> + Send,
+{
+    let row = stream
+        .try_next()
+        .await
+        .map_err(error::into_error)?
+        .ok_or_else(|| Error::NotFound)?;
+    U::build_from_row(&PgRow::new(row)).map_err(Error::DeserializationError)
+}
+
+async fn lookup_type(
+    schema: &Option<String>,
+    type_name: &String,
+    conn: &mut PoolConnection<'_>,
+) -> QueryResult<(u32, u32)> {
+    match *schema {
+        Some(ref schema) => LOOK_UP.bind([type_name, schema]).query(conn),
+        None => LOOK_UP_NO_SCHEMA.bind([type_name]).query(conn),
+    }
+    .await
+    .map_err(error::into_error)?
+    .try_next()
+    .await
+    .map_err(error::into_error)?
+    .ok_or_else(|| Error::NotFound)
+    .map(|r| (r.get(0), r.get(1)))
 }
 
 fn type_from_oid(t: &PgTypeMetadata) -> QueryResult<Type> {
@@ -321,289 +340,10 @@ fn type_from_oid(t: &PgTypeMetadata) -> QueryResult<Type> {
     }))
 }
 
-impl AsyncPgConnection {
-    /// Build a transaction, specifying additional details such as isolation level
-    ///
-    /// See [`TransactionBuilder`] for more examples.
-    ///
-    /// [`TransactionBuilder`]: crate::pg::TransactionBuilder
-    ///
-    /// ```rust
-    /// # include!("./doc_test.rs");
-    /// # use scoped_futures::ScopedFutureExt;
-    /// #
-    /// # #[tokio::main(flavor = "current_thread")]
-    /// # async fn main() {
-    /// #     run_test().await.unwrap();
-    /// # }
-    /// #
-    /// # async fn run_test() -> QueryResult<()> {
-    /// #     use schema::users::dsl::*;
-    /// #     let conn = &mut connection_no_transaction().await;
-    /// conn.build_transaction()
-    ///     .read_only()
-    ///     .serializable()
-    ///     .deferrable()
-    ///     .run(|conn| async move { Ok(()) }.scope_boxed())
-    ///     .await
-    /// # }
-    /// ```
-    pub fn build_transaction(&mut self) -> TransactionBuilder<'_, Self> {
-        TransactionBuilder::new(self)
-    }
-
-    /// Construct a new `AsyncPgConnection` instance from an existing [`tokio_postgres::Client`]
-    pub async fn try_from(conn: Client) -> ConnectionResult<Self> {
-        Self::setup(
-            conn,
-            None,
-            ErrorJoiner::new(None),
-            Mutex::new(diesel::connection::get_default_instrumentation()),
-        )
-        .await
-    }
-
-    async fn setup(
-        conn: Client,
-        database_url: Option<&str>,
-        error_joiner: ErrorJoiner,
-        instrumentation: Mutex<Option<Box<dyn Instrumentation>>>,
-    ) -> ConnectionResult<Self> {
-        let mut conn = Self {
-            conn: Arc::new(conn),
-            cache: Arc::new(Cache {
-                stmt: AsyncMutex::new(StatementCache::new()),
-                meta: AsyncMutex::new(PgMetadataCache::new()),
-                error_joiner,
-                instrumentation,
-            }),
-        };
-        let res = conn
-            .set_config_options()
-            .await
-            .map_err(ConnectionError::CouldntSetupConfiguration);
-
-        if let Some(database_url) = database_url {
-            conn.record_instrumentation(InstrumentationEvent::finish_establish_connection(
-                database_url,
-                res.as_ref().err(),
-            ));
-        }
-
-        Ok(conn)
-    }
-
-    /// Constructs a cancellation token that can later be used to request cancellation of a query running on the connection associated with this client.
-    pub fn cancel_token(&self) -> xitca_postgres::Session {
-        self.conn.cancel_token()
-    }
-
-    async fn set_config_options(&mut self) -> QueryResult<()> {
-        "SET TIME ZONE 'UTC'; SET CLIENT_ENCODING TO 'UTF8'"
-            .execute(&self.conn)
-            .await
-            .map_err(error::into_error)?;
-        Ok(())
-    }
-
-    fn with_prepared_statement<T, C, F, R>(
-        &self,
-        query: T,
-        callback: C,
-    ) -> BoxFuture<'static, QueryResult<R>>
-    where
-        T: QueryFragment<Pg> + QueryId,
-        C: FnOnce(&Statement, &Client, Binds) -> F + Send + 'static,
-        F: Future<Output = Result<R, xitca_postgres::Error>> + Send + 'static,
-        R: Send,
-    {
-        self.record_instrumentation(InstrumentationEvent::start_query(&diesel::debug_query(
-            &query,
-        )));
-
-        // we explicilty descruct the query here before going into the async block
-        //
-        // That's required to remove the send bound from `T` as we have translated
-        // the query type to just a string (for the SQL) and a bunch of bytes (for the binds)
-        // which both are `Send`.
-        // We also collect the query id (essentially an integer) and the safe_to_cache flag here
-        // so there is no need to even access the query in the async block below
-        let mut query_builder = PgQueryBuilder::default();
-
-        let bind_result = construct_bind_data(&query);
-
-        let to_sql = query
-            .to_sql(&mut query_builder, &Pg)
-            .map(|_| query_builder.finish());
-
-        // The code that doesn't need the `T` generic parameter is in a separate function to reduce LLVM IR lines
-        self.with_prepared_statement_after_sql_built(
-            callback,
-            query.is_safe_to_cache_prepared(&Pg),
-            T::query_id(),
-            to_sql,
-            bind_result,
-        )
-    }
-
-    fn with_prepared_statement_after_sql_built<C, F, R>(
-        &self,
-        callback: C,
-        is_safe_to_cache_prepared: QueryResult<bool>,
-        query_id: Option<TypeId>,
-        to_sql: QueryResult<String>,
-        bind_result: Result<BindData, Error>,
-    ) -> BoxFuture<'static, QueryResult<R>>
-    where
-        C: FnOnce(&Statement, &Client, Binds) -> F + Send + 'static,
-        F: Future<Output = Result<R, xitca_postgres::Error>> + Send + 'static,
-        R: Send,
-    {
-        let raw_connection = self.conn.clone();
-        let cache = self.cache.clone();
-
-        Box::pin(async move {
-            let sql = to_sql?;
-            let is_safe_to_cache_prepared = is_safe_to_cache_prepared?;
-
-            // Check whether we need to resolve some types at all
-            //
-            // If the user doesn't use custom types there is no need
-            // to bother with that at all
-            let bind_collector = bind_result?.type_resolver(&raw_connection, &cache).await?;
-
-            #[cfg(feature = "instrumentation")]
-            let cache_clone = cache.clone();
-
-            let source = QueryFragmentHelper {
-                sql: &sql,
-                safe_to_cache: is_safe_to_cache_prepared,
-            };
-
-            let res = cache
-                .stmt
-                .lock()
-                .await
-                .cached_statement_non_generic(
-                    query_id,
-                    &source,
-                    &Pg,
-                    &bind_collector.metadata,
-                    raw_connection,
-                    prepare_statement_helper,
-                    &mut move |_event: InstrumentationEvent<'_>| {
-                        #[cfg(feature = "instrumentation")]
-                        {
-                            // we wrap this lock into another callback to prevent locking
-                            // the instrumentation longer than necessary
-                            cache_clone.record_instrumentation(_event);
-                        }
-                    },
-                )
-                .await
-                .map(|(stmt, cli)| {
-                    let binds = bind_collector
-                        .metadata
-                        .into_iter()
-                        .zip(bind_collector.binds);
-
-                    match stmt {
-                        MaybeCached::CannotCache(stmt) => {
-                            // it's important to reconstruct the statement guard when the statement is not cached
-                            // the guard is tasked with cancel the statement object from db server after the query is done
-                            let stmt = stmt.into_guarded(&cli);
-                            callback(&stmt, &cli, binds)
-                        }
-                        MaybeCached::Cached(stmt) => callback(stmt, &cli, binds),
-                        _ => unreachable!(),
-                    }
-                })?;
-
-            let res = match res.await {
-                Ok(res) => Ok(res),
-                Err(e) => Err(cache.error_joiner.join(e).await),
-            };
-
-            cache.record_instrumentation(InstrumentationEvent::finish_query(
-                &StrQueryHelper::new(&sql),
-                res.as_ref().err(),
-            ));
-
-            res
-        })
-    }
-
-    fn record_instrumentation(&self, event: InstrumentationEvent<'_>) {
-        self.cache.record_instrumentation(event);
-    }
-}
-
 struct BindData {
     fake_oid_locations: Vec<(usize, usize)>,
     generated_oids: GeneratedOidTypeMap,
     bind_collector: RawBytesBindCollector<Pg>,
-}
-
-impl BindData {
-    async fn type_resolver(
-        self,
-        conn: &Client,
-        cache: &Cache,
-    ) -> Result<RawBytesBindCollector<Pg>, Error> {
-        let Self {
-            fake_oid_locations,
-            generated_oids,
-            mut bind_collector,
-        } = self;
-
-        if let Some(ref unresolved_types) = generated_oids {
-            let metadata_cache = &mut *cache.meta.lock().await;
-            let mut real_oids = HashMap::new();
-
-            for ((schema, lookup_type_name), (fake_oid, fake_array_oid)) in unresolved_types {
-                // for each unresolved item
-                // we check whether it's already in the cache
-                // or perform a lookup and insert it into the cache
-                let cache_key = PgMetadataCacheKey::new(
-                    schema.as_deref().map(Into::into),
-                    lookup_type_name.into(),
-                );
-                let real_metadata =
-                    if let Some(type_metadata) = metadata_cache.lookup_type(&cache_key) {
-                        type_metadata
-                    } else {
-                        let type_metadata = lookup_type(schema, lookup_type_name, conn).await?;
-                        metadata_cache.store_type(cache_key, type_metadata);
-
-                        PgTypeMetadata::from_result(Ok(type_metadata))
-                    };
-                // let (fake_oid, fake_array_oid) = metadata_lookup.fake_oids(index);
-                let (real_oid, real_array_oid) = unwrap_oids(&real_metadata);
-                real_oids.extend([(*fake_oid, real_oid), (*fake_array_oid, real_array_oid)]);
-            }
-
-            // Replace fake OIDs with real OIDs in `bind_collector.metadata`
-            for m in &mut bind_collector.metadata {
-                let (oid, array_oid) = unwrap_oids(m);
-                *m = PgTypeMetadata::new(
-                    real_oids.get(&oid).copied().unwrap_or(oid),
-                    real_oids.get(&array_oid).copied().unwrap_or(array_oid),
-                );
-            }
-
-            // Replace fake OIDs with real OIDs in `bind_collector.binds`
-            for (bind_index, byte_index) in fake_oid_locations {
-                replace_fake_oid(
-                    &mut bind_collector.binds,
-                    &real_oids,
-                    bind_index,
-                    byte_index,
-                )?;
-            }
-        }
-
-        Ok(bind_collector)
-    }
 }
 
 fn construct_bind_data(query: &dyn QueryFragment<Pg>) -> Result<BindData, Error> {
@@ -739,8 +479,8 @@ fn construct_bind_data(query: &dyn QueryFragment<Pg>) -> Result<BindData, Error>
 
 type GeneratedOidTypeMap = Option<HashMap<(Option<String>, String), (u32, u32)>>;
 
-/// Collects types that need to be looked up, and causes fake OIDs to be written into the bind collector
-/// so they can be replaced with asynchronously fetched OIDs after the original query is dropped
+// Collects types that need to be looked up, and causes fake OIDs to be written into the bind collector
+// so they can be replaced with asynchronously fetched OIDs after the original query is dropped
 struct PgAsyncMetadataLookup<F: FnMut(&str, Option<&str>) -> (u32, u32) + 'static> {
     custom_oid: bool,
     generated_oids: GeneratedOidTypeMap,
@@ -780,24 +520,6 @@ const LOOK_UP_NO_SCHEMA: StatementNamed<'_> = Statement::named(
     &[],
 );
 
-async fn lookup_type(
-    schema: &Option<String>,
-    type_name: &String,
-    raw_connection: &Client,
-) -> QueryResult<(u32, u32)> {
-    match *schema {
-        Some(ref schema) => LOOK_UP.bind([type_name, schema]).query(raw_connection),
-        None => LOOK_UP_NO_SCHEMA.bind([type_name]).query(raw_connection),
-    }
-    .await
-    .map_err(error::into_error)?
-    .try_next()
-    .await
-    .map_err(error::into_error)?
-    .ok_or_else(|| Error::NotFound)
-    .map(|r| (r.get(0), r.get(1)))
-}
-
 fn unwrap_oids(metadata: &PgTypeMetadata) -> (u32, u32) {
     let err_msg = "PgTypeMetadata is supposed to always be Ok here";
     (
@@ -830,42 +552,4 @@ fn replace_fake_oid(
                 .into(),
             )
         })
-}
-
-impl PoolableConnection for AsyncPgConnection {
-    fn is_broken(&mut self) -> bool {
-        self.conn.closed()
-    }
-}
-
-impl QueryFragmentForCachedStatement<Pg> for QueryFragmentHelper<'_> {
-    fn construct_sql(&self, _backend: &Pg) -> QueryResult<String> {
-        Ok(self.sql.to_string())
-    }
-
-    fn is_safe_to_cache_prepared(&self, _backend: &Pg) -> QueryResult<bool> {
-        Ok(self.safe_to_cache)
-    }
-}
-
-fn prepare_statement_helper(
-    conn: Arc<Client>,
-    sql: &str,
-    _is_for_cache: PrepareForCache,
-    metadata: &[PgTypeMetadata],
-) -> CallbackHelper<impl Future<Output = QueryResult<(Statement, Arc<Client>)>> + Send + use<>> {
-    let bind_types = metadata
-        .iter()
-        .map(type_from_oid)
-        .collect::<QueryResult<Vec<_>>>();
-    let sql = sql.to_string();
-    CallbackHelper(async move {
-        let bind_types = bind_types?;
-        let stmt = xitca_postgres::Statement::named(&sql, &bind_types)
-            .execute(&conn)
-            .await
-            .map_err(error::into_error)?
-            .leak();
-        Ok((stmt, conn))
-    })
 }

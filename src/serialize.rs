@@ -4,7 +4,7 @@ use diesel::pg::PgTypeMetadata;
 use xitca_postgres::types::{IsNull, ToSql, Type, WrongType, private::BytesMut};
 
 #[derive(Debug)]
-pub(super) struct ToSqlHelper(pub(super) PgTypeMetadata, pub(super) Option<Vec<u8>>);
+pub(super) struct ToSqlHelper(pub(super) (PgTypeMetadata, Option<Vec<u8>>));
 
 impl ToSql for ToSqlHelper {
     fn to_sql(
@@ -15,7 +15,7 @@ impl ToSql for ToSqlHelper {
     where
         Self: Sized,
     {
-        if let Some(ref bytes) = self.1 {
+        if let Some(ref bytes) = self.0.1 {
             out.extend_from_slice(bytes);
             Ok(IsNull::No)
         } else {
@@ -36,7 +36,7 @@ impl ToSql for ToSqlHelper {
         ty: &Type,
         out: &mut BytesMut,
     ) -> Result<IsNull, Box<dyn error::Error + Sync + Send>> {
-        if Type::from_oid(self.0.oid()?)
+        if Type::from_oid(self.0.0.oid()?)
             .map(|d| ty != &d)
             .unwrap_or(false)
         {

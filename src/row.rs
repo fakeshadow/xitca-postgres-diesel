@@ -8,24 +8,25 @@ use diesel::{
     row::{Field, PartialRow, Row, RowIndex, RowSealed},
 };
 use xitca_postgres::{
-    row::RowOwned,
+    row,
     types::{FromSql, Type},
 };
 
-pub struct PgRow {
-    row: RowOwned,
+pub struct PgRow<'a> {
+    row: row::Row<'a>,
 }
 
-impl PgRow {
-    pub(super) fn new(row: RowOwned) -> Self {
+impl<'a> PgRow<'a> {
+    pub(super) fn new(row: row::Row<'a>) -> Self {
         Self { row }
     }
 }
-impl RowSealed for PgRow {}
 
-impl<'a> Row<'a, Pg> for PgRow {
+impl RowSealed for PgRow<'_> {}
+
+impl<'a> Row<'a, Pg> for PgRow<'a> {
     type Field<'b>
-        = PgField<'b>
+        = PgField<'b, 'a>
     where
         Self: 'b,
         'a: 'b;
@@ -52,7 +53,7 @@ impl<'a> Row<'a, Pg> for PgRow {
     }
 }
 
-impl RowIndex<usize> for PgRow {
+impl RowIndex<usize> for PgRow<'_> {
     fn idx(&self, idx: usize) -> Option<usize> {
         if idx < self.row.len() {
             Some(idx)
@@ -62,18 +63,18 @@ impl RowIndex<usize> for PgRow {
     }
 }
 
-impl<'a> RowIndex<&'a str> for PgRow {
-    fn idx(&self, idx: &'a str) -> Option<usize> {
+impl RowIndex<&str> for PgRow<'_> {
+    fn idx(&self, idx: &str) -> Option<usize> {
         self.row.columns().iter().position(|c| c.name() == idx)
     }
 }
 
-pub struct PgField<'a> {
-    row: &'a RowOwned,
+pub struct PgField<'a, 'b> {
+    row: &'a row::Row<'b>,
     idx: usize,
 }
 
-impl<'a> Field<'a, Pg> for PgField<'a> {
+impl<'a> Field<'a, Pg> for PgField<'a, '_> {
     fn field_name(&self) -> Option<&str> {
         Some(self.row.columns()[self.idx].name())
     }
