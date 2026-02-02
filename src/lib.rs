@@ -44,7 +44,7 @@ pub struct AsyncPgConnection {
 type Meta = AsyncMutex<PgMetadataCache>;
 
 impl AsyncPgConnection {
-    pub fn establish(url: &str) -> Result<Self, ConnectionError> {
+    pub async fn establish(url: &str) -> Result<Self, ConnectionError> {
         let pool = Pool::builder(url)
             .build()
             .map_err(error::into_connection_error)?;
@@ -54,6 +54,18 @@ impl AsyncPgConnection {
             meta: Default::default(),
         })
     }
+
+    pub async fn transaction<F, T>(&self, exec: F) -> QueryResult<T>
+    where
+        F: AsyncFnOnce(&mut TransactionConnection<'_>) -> QueryResult<T>,
+    {
+        let conn = self.pool.get().await.map_err(error::into_error)?;
+        let mut conn = TransactionConnection {
+            conn,
+            meta: &self.meta,
+        };
+        exec(&mut conn).await
+    }
 }
 
 pub trait RunQueryDsl<C>
@@ -61,15 +73,81 @@ where
     Self: AsQuery + Send,
     Self::Query: QueryFragment<Pg> + QueryId + Send,
 {
+    /// async version of [`diesel::query_dsl::RunQueryDsl::execute`]
     fn execute(self, conn: C) -> impl Future<Output = QueryResult<usize>> + Send;
 
-    fn get_result<U>(self, conn: C) -> impl Future<Output = QueryResult<U>> + Send
-    where
-        U: FromSqlRow<Self::SqlType, Pg> + Send;
+    #[doc(hidden)]
+    fn load_stream(self, conn: C) -> impl Future<Output = QueryResult<RowStreamOwned>> + Send;
 
+    /// async version of [`diesel::query_dsl::RunQueryDsl::load`]
     fn load<U>(self, conn: C) -> impl Future<Output = QueryResult<Vec<U>>> + Send
     where
-        U: FromSqlRow<Self::SqlType, Pg> + Send;
+        U: FromSqlRow<Self::SqlType, Pg> + Send,
+        C: Send,
+        Self: Sized,
+    {
+        async {
+            let mut res = Vec::new();
+            self.load_into(conn, &mut res).await.map(|_| res)
+        }
+    }
+
+    /// alternative version of [`diesel::query_dsl::RunQueryDsl::load_iter`] where the iteration
+    /// happens inside the method with given collection type. when function returns sucessfully
+    /// the given collection type would be populated with types converted from row data
+    fn load_into<U, R>(
+        self,
+        conn: C,
+        collection: &mut R,
+    ) -> impl Future<Output = QueryResult<()>> + Send
+    where
+        U: FromSqlRow<Self::SqlType, Pg> + Send,
+        R: Extend<U> + Send,
+        C: Send,
+        Self: Sized,
+    {
+        async {
+            let stream = self.load_stream(conn).await?;
+            try_collect_into(stream, collection).await
+        }
+    }
+
+    /// async version of [`diesel::query_dsl::RunQueryDsl::get_result`]
+    fn get_result<U>(self, conn: C) -> impl Future<Output = QueryResult<U>> + Send
+    where
+        U: FromSqlRow<Self::SqlType, Pg> + Send,
+        C: Send,
+        Self: Sized,
+    {
+        async {
+            let mut stream = self.load_stream(conn).await?;
+            try_next(&mut stream).await?.ok_or_else(|| Error::NotFound)
+        }
+    }
+
+    /// alternative version of [`diesel::query_dsl::RunQueryDsl::get_results`]
+    #[inline]
+    fn get_results<U>(self, conn: C) -> impl Future<Output = QueryResult<Vec<U>>> + Send
+    where
+        U: FromSqlRow<Self::SqlType, Pg> + Send,
+        C: Send,
+        Self: Sized,
+    {
+        self.load(conn)
+    }
+
+    /// async version of [`diesel::query_dsl::RunQueryDsl::first`]
+    #[inline]
+    fn first<U>(self, conn: C) -> impl Future<Output = QueryResult<U>> + Send
+    where
+        U: FromSqlRow<<diesel::dsl::Limit<Self> as AsQuery>::SqlType, Pg> + Send,
+        C: Send,
+        Self: diesel::query_dsl::methods::LimitDsl + Sized,
+        diesel::dsl::Limit<Self>: RunQueryDsl<C>,
+        <diesel::dsl::Limit<Self> as AsQuery>::Query: QueryFragment<Pg> + QueryId + Send,
+    {
+        diesel::query_dsl::methods::LimitDsl::limit(self, 1).get_result(conn)
+    }
 }
 
 impl<Q> RunQueryDsl<&AsyncPgConnection> for Q
@@ -88,26 +166,9 @@ where
         Ok(res as _)
     }
 
-    async fn get_result<U>(self, conn: &AsyncPgConnection) -> QueryResult<U>
-    where
-        U: FromSqlRow<Self::SqlType, Pg> + Send,
-    {
-        let stream = {
-            let mut pool_conn = conn.pool.get().await.map_err(error::into_error)?;
-            load(self, &mut pool_conn, &conn.meta).await?
-        };
-        try_next(stream).await
-    }
-
-    async fn load<U>(self, conn: &AsyncPgConnection) -> QueryResult<Vec<U>>
-    where
-        U: FromSqlRow<Q::SqlType, Pg> + Send,
-    {
-        let stream = {
-            let mut pool_conn = conn.pool.get().await.map_err(error::into_error)?;
-            load(self, &mut pool_conn, &conn.meta).await?
-        };
-        try_collect(stream).await
+    async fn load_stream(self, conn: &AsyncPgConnection) -> QueryResult<RowStreamOwned> {
+        let mut pool_conn = conn.pool.get().await.map_err(error::into_error)?;
+        load(self, &mut pool_conn, &conn.meta).await
     }
 }
 
@@ -122,27 +183,18 @@ where
     Q::Query: QueryFragment<Pg> + QueryId + Send,
 {
     async fn execute(self, conn: &mut TransactionConnection<'_>) -> QueryResult<usize> {
-        let res = execute(self, &mut conn.conn, &conn.meta)
+        let res = execute(self, &mut conn.conn, conn.meta)
             .await?
             .await
             .map_err(error::into_error)?;
         Ok(res as _)
     }
 
-    async fn get_result<U>(self, conn: &mut TransactionConnection<'_>) -> QueryResult<U>
-    where
-        U: FromSqlRow<Self::SqlType, Pg> + Send,
-    {
-        let stream = load(self, &mut conn.conn, &conn.meta).await?;
-        try_next(stream).await
-    }
-
-    async fn load<U>(self, conn: &mut TransactionConnection<'_>) -> QueryResult<Vec<U>>
-    where
-        U: FromSqlRow<Q::SqlType, Pg> + Send,
-    {
-        let stream = load(self, &mut conn.conn, &conn.meta).await?;
-        try_collect(stream).await
+    async fn load_stream(
+        self,
+        conn: &mut TransactionConnection<'_>,
+    ) -> QueryResult<RowStreamOwned> {
+        load(self, &mut conn.conn, conn.meta).await
     }
 }
 
@@ -281,30 +333,32 @@ where
     exec(conn, stmt, bind_collector).await
 }
 
-async fn try_collect<U, St>(mut stream: RowStreamOwned) -> QueryResult<Vec<U>>
+async fn try_collect_into<U, St, C>(
+    mut stream: RowStreamOwned,
+    collection: &mut C,
+) -> QueryResult<()>
 where
     U: FromSqlRow<St, Pg> + Send,
+    C: Extend<U>,
 {
-    let mut res = Vec::new();
-
-    while let Some(row) = stream.try_next().await.map_err(error::into_error)? {
-        let item = U::build_from_row(&PgRow::new(row)).map_err(Error::DeserializationError)?;
-        res.push(item);
+    while let Some(item) = try_next(&mut stream).await? {
+        collection.extend(Some(item));
     }
-
-    Ok(res)
+    Ok(())
 }
 
-async fn try_next<U, St>(mut stream: RowStreamOwned) -> QueryResult<U>
+async fn try_next<U, St>(stream: &mut RowStreamOwned) -> QueryResult<Option<U>>
 where
     U: FromSqlRow<St, Pg> + Send,
 {
-    let row = stream
-        .try_next()
-        .await
-        .map_err(error::into_error)?
-        .ok_or_else(|| Error::NotFound)?;
-    U::build_from_row(&PgRow::new(row)).map_err(Error::DeserializationError)
+    match stream.try_next().await {
+        Ok(Some(row)) => {
+            let item = U::build_from_row(&PgRow::new(row)).map_err(Error::DeserializationError)?;
+            Ok(Some(item))
+        }
+        Ok(None) => Ok(None),
+        Err(e) => Err(error::into_error(e)),
+    }
 }
 
 async fn lookup_type(
