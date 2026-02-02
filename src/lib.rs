@@ -1,10 +1,10 @@
-//! diesel-async api powered by xitca-postgres db driver
+#![doc = include_str!("../README.md")]
 
 mod error;
 mod row;
 mod serialize;
-mod transaction_builder;
-mod transaction_manager;
+// mod transaction_builder;
+// mod transaction_manager;
 
 use core::future::Future;
 
@@ -19,6 +19,7 @@ use diesel::{
     query_builder::{
         AsQuery, QueryBuilder, QueryFragment, QueryId, bind_collector::RawBytesBindCollector,
     },
+    query_dsl::CompatibleType,
     result::{Error, QueryResult},
 };
 use tokio::sync::Mutex as AsyncMutex;
@@ -32,7 +33,7 @@ use xitca_postgres::{
 
 use self::{row::PgRow, serialize::ToSqlHelper};
 
-pub use transaction_builder::TransactionBuilder;
+// pub use transaction_builder::TransactionBuilder;
 
 const FAKE_OID: u32 = 0;
 
@@ -68,6 +69,7 @@ impl AsyncPgConnection {
     }
 }
 
+/// async version of [`diesel::query_dsl::RunQueryDsl`]
 pub trait RunQueryDsl<C>
 where
     Self: AsQuery + Send,
@@ -82,9 +84,10 @@ where
     /// async version of [`diesel::query_dsl::RunQueryDsl::load`]
     fn load<U>(self, conn: C) -> impl Future<Output = QueryResult<Vec<U>>> + Send
     where
-        U: FromSqlRow<Self::SqlType, Pg> + Send,
+        U: FromSqlRow<<Self::SqlType as CompatibleType<U, Pg>>::SqlType, Pg> + Send,
         C: Send,
         Self: Sized,
+        Self::SqlType: CompatibleType<U, Pg>,
     {
         async {
             let mut res = Vec::new();
@@ -101,10 +104,11 @@ where
         collection: &mut R,
     ) -> impl Future<Output = QueryResult<()>> + Send
     where
-        U: FromSqlRow<Self::SqlType, Pg> + Send,
+        U: FromSqlRow<<Self::SqlType as CompatibleType<U, Pg>>::SqlType, Pg> + Send,
         R: Extend<U> + Send,
         C: Send,
         Self: Sized,
+        Self::SqlType: CompatibleType<U, Pg>,
     {
         async {
             let stream = self.load_stream(conn).await?;
@@ -115,9 +119,10 @@ where
     /// async version of [`diesel::query_dsl::RunQueryDsl::get_result`]
     fn get_result<U>(self, conn: C) -> impl Future<Output = QueryResult<U>> + Send
     where
-        U: FromSqlRow<Self::SqlType, Pg> + Send,
+        U: FromSqlRow<<Self::SqlType as CompatibleType<U, Pg>>::SqlType, Pg> + Send,
         C: Send,
         Self: Sized,
+        Self::SqlType: CompatibleType<U, Pg>,
     {
         async {
             let mut stream = self.load_stream(conn).await?;
@@ -129,9 +134,10 @@ where
     #[inline]
     fn get_results<U>(self, conn: C) -> impl Future<Output = QueryResult<Vec<U>>> + Send
     where
-        U: FromSqlRow<Self::SqlType, Pg> + Send,
+        U: FromSqlRow<<Self::SqlType as CompatibleType<U, Pg>>::SqlType, Pg> + Send,
         C: Send,
         Self: Sized,
+        Self::SqlType: CompatibleType<U, Pg>,
     {
         self.load(conn)
     }
@@ -140,11 +146,15 @@ where
     #[inline]
     fn first<U>(self, conn: C) -> impl Future<Output = QueryResult<U>> + Send
     where
-        U: FromSqlRow<<diesel::dsl::Limit<Self> as AsQuery>::SqlType, Pg> + Send,
+        U: FromSqlRow<
+                <<diesel::dsl::Limit<Self> as AsQuery>::SqlType as CompatibleType<U, Pg>>::SqlType,
+                Pg,
+            > + Send,
         C: Send,
         Self: diesel::query_dsl::methods::LimitDsl + Sized,
         diesel::dsl::Limit<Self>: RunQueryDsl<C>,
         <diesel::dsl::Limit<Self> as AsQuery>::Query: QueryFragment<Pg> + QueryId + Send,
+        <diesel::dsl::Limit<Self> as AsQuery>::SqlType: CompatibleType<U, Pg>,
     {
         diesel::query_dsl::methods::LimitDsl::limit(self, 1).get_result(conn)
     }

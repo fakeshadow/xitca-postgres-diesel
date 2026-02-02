@@ -1,14 +1,12 @@
-an async ORM for postgresql built upon [diesel-async](https://crates.io/crates/diesel-async)
+an async ORM for postgresql built upon [diesel](https://crates.io/crates/diesel)
 
 ## Usage
-`xitca-postgres-diesel` is an extension crate of `diesel-async` by offering connection type
-that can hook into `diesel` and `diesel-async` ecosystem
+`xitca-postgres-diesel` is an extension crate of `diesel` by offering PostgreSQL connection type enabling async to it's ecosystem
 
 ## QuickStart
 `Cargo.toml`
 ```toml
 diesel = "2"
-diesel-async = "0.5"
 xitca-postgres-diesel = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
@@ -16,10 +14,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```rust
 // diesel is used for dsl query building
 use diesel::prelude::*;
-// diesel-async provides types and traits interface for interacting with diesel dsl
-use diesel_async::{RunQueryDsl, AsyncConnection};
-// this crate offers lower level pg connection type
-use xitca_postgres_diesel::AsyncPgConnection;
+// this crate offers lower level pg connection type and execution methods of diesel query builder
+use xitca_postgres_diesel::{AsyncPgConnection, RunQueryDsl};
 
 // please reference diesel crate for its macro usage
 table! {
@@ -39,16 +35,15 @@ struct User {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // create an async pg connection with xitca_postgres_diesel
-    let mut connection = AsyncPgConnection::establish(&std::env::var("DATABASE_URL")?).await?;
+    let connection = AsyncPgConnection::establish(&std::env::var("DATABASE_URL")?).await?;
 
     // use diesel query dsl to construct your query
     let data: Vec<User> = users::table
         .filter(users::id.gt(0))
         .or_filter(users::name.like("%Luke"))
         .select(User::as_select())
-        // execute the query via the provided
-        // async `diesel_async::RunQueryDsl`
-        .load(&mut connection)
+        // execute the query via the provided `xitca_postgres_diesel::RunQueryDsl` trait
+        .load(&connection)
         .await?;
 
     Ok(())
