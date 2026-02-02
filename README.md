@@ -7,7 +7,7 @@ an async ORM for postgresql built upon [diesel](https://crates.io/crates/diesel)
 `Cargo.toml`
 ```toml
 diesel = "2"
-xitca-postgres-diesel = "0.1"
+xitca-postgres-diesel = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 `main.rs`
