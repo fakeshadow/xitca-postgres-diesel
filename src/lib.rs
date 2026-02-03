@@ -3,12 +3,13 @@
 mod error;
 mod row;
 mod serialize;
-// mod transaction_builder;
-// mod transaction_manager;
 
-use core::future::Future;
+use core::{future::Future, iter::Zip};
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    vec::IntoIter,
+};
 
 use diesel::{
     ConnectionError,
@@ -28,12 +29,11 @@ use xitca_postgres::{
     iter::AsyncLendingIterator,
     pool::{CachedStatement, Pool, PoolConnection},
     statement::{Statement, StatementNamed},
+    transaction::Transaction,
     types::Type,
 };
 
 use self::{row::PgRow, serialize::ToSqlHelper};
-
-// pub use transaction_builder::TransactionBuilder;
 
 const FAKE_OID: u32 = 0;
 
@@ -56,16 +56,39 @@ impl AsyncPgConnection {
         })
     }
 
+    /// start a transction with given async closure.
+    /// the transaction would implicitly begin before the async closure runs and end after the closure finish.
+    /// when the async closure returns with Ok path the transaction would implicitly commit and returns with the value of OK if the commit succeed.
+    /// when the async closure returns with Err path the transaction would implicitly rollback and returns with the value of if the rollback succeed.
+    /// commit and rollback error has higher priority than the outcome of async closure.
     pub async fn transaction<F, T>(&self, exec: F) -> QueryResult<T>
     where
         F: AsyncFnOnce(&mut TransactionConnection<'_>) -> QueryResult<T>,
     {
-        let conn = self.pool.get().await.map_err(error::into_error)?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(error::into_error)?
+            .transaction_owned()
+            .await
+            .map_err(error::into_error)?;
+
         let mut conn = TransactionConnection {
             conn,
             meta: &self.meta,
         };
-        exec(&mut conn).await
+
+        match exec(&mut conn).await {
+            Ok(res) => {
+                conn.conn.commit().await.map_err(error::into_error)?;
+                Ok(res)
+            }
+            Err(e) => {
+                conn.conn.rollback().await.map_err(error::into_error)?;
+                Err(e)
+            }
+        }
     }
 }
 
@@ -130,7 +153,7 @@ where
         }
     }
 
-    /// alternative version of [`diesel::query_dsl::RunQueryDsl::get_results`]
+    /// async version of [`diesel::query_dsl::RunQueryDsl::get_results`]
     #[inline]
     fn get_results<U>(self, conn: C) -> impl Future<Output = QueryResult<Vec<U>>> + Send
     where
@@ -183,7 +206,7 @@ where
 }
 
 pub struct TransactionConnection<'a> {
-    conn: PoolConnection<'a>,
+    conn: Transaction<PoolConnection<'a>>,
     meta: &'a Meta,
 }
 
@@ -193,7 +216,7 @@ where
     Q::Query: QueryFragment<Pg> + QueryId + Send,
 {
     async fn execute(self, conn: &mut TransactionConnection<'_>) -> QueryResult<usize> {
-        let res = execute(self, &mut conn.conn, conn.meta)
+        let res = execute_tx(self, &mut conn.conn, conn.meta)
             .await?
             .await
             .map_err(error::into_error)?;
@@ -204,7 +227,7 @@ where
         self,
         conn: &mut TransactionConnection<'_>,
     ) -> QueryResult<RowStreamOwned> {
-        load(self, &mut conn.conn, conn.meta).await
+        load_tx(self, &mut conn.conn, conn.meta).await
     }
 }
 
@@ -217,14 +240,8 @@ where
     Q: AsQuery + Send,
     Q::Query: QueryFragment<Pg> + QueryId + Send,
 {
-    execute_with(query, conn, meta, async |conn, stmt, bind_collector| {
-        let binds = bind_collector
-            .metadata
-            .into_iter()
-            .zip(bind_collector.binds)
-            .map(ToSqlHelper);
-
-        Ok(stmt.bind(binds).execute(&*conn))
+    execute_with(query, conn, meta, async |conn, stmt, bind| {
+        Ok(stmt.bind(bind.map(ToSqlHelper)).execute(&*conn))
     })
     .await
 }
@@ -238,14 +255,8 @@ where
     Q: AsQuery + Send,
     Q::Query: QueryFragment<Pg> + QueryId + Send,
 {
-    execute_with(query, conn, meta, async |conn, stmt, bind_collector| {
-        let binds = bind_collector
-            .metadata
-            .into_iter()
-            .zip(bind_collector.binds)
-            .map(ToSqlHelper);
-
-        stmt.bind(binds)
+    execute_with(query, conn, meta, async |conn, stmt, bind| {
+        stmt.bind(bind.map(ToSqlHelper))
             .into_owned()
             .query(&*conn)
             .await
@@ -263,77 +274,69 @@ async fn execute_with<Q, E, R>(
 where
     Q: AsQuery + Send,
     Q::Query: QueryFragment<Pg> + QueryId + Send,
+    E: AsyncFnOnce(&mut PoolConnection<'_>, CachedStatement, BindValue) -> QueryResult<R>,
+{
+    let (sql, bind_types, bind_collector) = conn.pre_execute(query, meta).await?;
+
+    let stmt = xitca_postgres::Statement::named(&sql, &bind_types)
+        .execute(&mut *conn)
+        .await
+        .map_err(error::into_error)?;
+
+    exec(conn, stmt, bind_collector).await
+}
+
+// code duplication between plain connection and transaction connection due to HKT compiler bug.
+async fn execute_tx<Q>(
+    query: Q,
+    conn: &mut Transaction<PoolConnection<'_>>,
+    meta: &Meta,
+) -> QueryResult<impl Future<Output = Result<u64, xitca_postgres::Error>> + 'static>
+where
+    Q: AsQuery + Send,
+    Q::Query: QueryFragment<Pg> + QueryId + Send,
+{
+    execute_with_tx(query, conn, meta, async |conn, stmt, bind| {
+        Ok(stmt.bind(bind.map(ToSqlHelper)).execute(&*conn))
+    })
+    .await
+}
+
+async fn load_tx<Q>(
+    query: Q,
+    conn: &mut Transaction<PoolConnection<'_>>,
+    meta: &Meta,
+) -> QueryResult<RowStreamOwned>
+where
+    Q: AsQuery + Send,
+    Q::Query: QueryFragment<Pg> + QueryId + Send,
+{
+    execute_with_tx(query, conn, meta, async |conn, stmt, bind| {
+        stmt.bind(bind.map(ToSqlHelper))
+            .into_owned()
+            .query(&*conn)
+            .await
+            .map_err(error::into_error)
+    })
+    .await
+}
+
+async fn execute_with_tx<Q, E, R>(
+    query: Q,
+    conn: &mut Transaction<PoolConnection<'_>>,
+    meta: &Meta,
+    exec: E,
+) -> QueryResult<R>
+where
+    Q: AsQuery + Send,
+    Q::Query: QueryFragment<Pg> + QueryId + Send,
     E: AsyncFnOnce(
-        &mut PoolConnection<'_>,
+        &mut Transaction<PoolConnection<'_>>,
         CachedStatement,
-        RawBytesBindCollector<Pg>,
+        BindValue,
     ) -> QueryResult<R>,
 {
-    let query = query.as_query();
-
-    let mut query_builder = PgQueryBuilder::default();
-
-    let bind_data = construct_bind_data(&query)?;
-
-    query.to_sql(&mut query_builder, &Pg)?;
-
-    let sql = query_builder.finish();
-
-    let BindData {
-        fake_oid_locations,
-        generated_oids,
-        mut bind_collector,
-    } = bind_data;
-
-    if let Some(ref unresolved_types) = generated_oids {
-        let metadata_cache = &mut *meta.lock().await;
-        let mut real_oids = HashMap::new();
-
-        for ((schema, lookup_type_name), (fake_oid, fake_array_oid)) in unresolved_types {
-            // for each unresolved item
-            // we check whether it's already in the cache
-            // or perform a lookup and insert it into the cache
-            let cache_key =
-                PgMetadataCacheKey::new(schema.as_deref().map(Into::into), lookup_type_name.into());
-            let real_metadata = if let Some(type_metadata) = metadata_cache.lookup_type(&cache_key)
-            {
-                type_metadata
-            } else {
-                let type_metadata = lookup_type(schema, lookup_type_name, conn).await?;
-                metadata_cache.store_type(cache_key, type_metadata);
-
-                PgTypeMetadata::from_result(Ok(type_metadata))
-            };
-            // let (fake_oid, fake_array_oid) = metadata_lookup.fake_oids(index);
-            let (real_oid, real_array_oid) = unwrap_oids(&real_metadata);
-            real_oids.extend([(*fake_oid, real_oid), (*fake_array_oid, real_array_oid)]);
-        }
-
-        // Replace fake OIDs with real OIDs in `bind_collector.metadata`
-        for m in &mut bind_collector.metadata {
-            let (oid, array_oid) = unwrap_oids(m);
-            *m = PgTypeMetadata::new(
-                real_oids.get(&oid).copied().unwrap_or(oid),
-                real_oids.get(&array_oid).copied().unwrap_or(array_oid),
-            );
-        }
-
-        // Replace fake OIDs with real OIDs in `bind_collector.binds`
-        for (bind_index, byte_index) in fake_oid_locations {
-            replace_fake_oid(
-                &mut bind_collector.binds,
-                &real_oids,
-                bind_index,
-                byte_index,
-            )?;
-        }
-    }
-
-    let bind_types = bind_collector
-        .metadata
-        .iter()
-        .map(type_from_oid)
-        .collect::<QueryResult<Vec<_>>>()?;
+    let (sql, bind_types, bind_collector) = conn.pre_execute(query, meta).await?;
 
     let stmt = xitca_postgres::Statement::named(&sql, &bind_types)
         .execute(&mut *conn)
@@ -371,22 +374,138 @@ where
     }
 }
 
-async fn lookup_type(
-    schema: &Option<String>,
-    type_name: &String,
-    conn: &mut PoolConnection<'_>,
-) -> QueryResult<(u32, u32)> {
-    match *schema {
-        Some(ref schema) => LOOK_UP.bind([type_name, schema]).query(conn),
-        None => LOOK_UP_NO_SCHEMA.bind([type_name]).query(conn),
+type BindValue = Zip<IntoIter<PgTypeMetadata>, IntoIter<Option<Vec<u8>>>>;
+
+trait Execute2: Send {
+    fn pre_execute<Q>(
+        &mut self,
+        query: Q,
+        meta: &Meta,
+    ) -> impl Future<Output = QueryResult<(String, Vec<Type>, BindValue)>> + Send
+    where
+        Q: AsQuery + Send,
+        Q::Query: QueryFragment<Pg> + QueryId + Send,
+    {
+        async {
+            let query = query.as_query();
+
+            let mut query_builder = PgQueryBuilder::default();
+
+            let bind_data = construct_bind_data(&query)?;
+
+            query.to_sql(&mut query_builder, &Pg)?;
+
+            let sql = query_builder.finish();
+
+            let BindData {
+                fake_oid_locations,
+                generated_oids,
+                mut bind_collector,
+            } = bind_data;
+
+            if let Some(ref unresolved_types) = generated_oids {
+                let metadata_cache = &mut *meta.lock().await;
+                let mut real_oids = HashMap::new();
+
+                for ((schema, lookup_type_name), (fake_oid, fake_array_oid)) in unresolved_types {
+                    // for each unresolved item
+                    // we check whether it's already in the cache
+                    // or perform a lookup and insert it into the cache
+                    let cache_key = PgMetadataCacheKey::new(
+                        schema.as_deref().map(Into::into),
+                        lookup_type_name.into(),
+                    );
+                    let real_metadata =
+                        if let Some(type_metadata) = metadata_cache.lookup_type(&cache_key) {
+                            type_metadata
+                        } else {
+                            let type_metadata = self
+                                .lookup_type(schema, lookup_type_name)
+                                .await?
+                                .try_next()
+                                .await
+                                .map_err(error::into_error)?
+                                .ok_or_else(|| Error::NotFound)
+                                .map(|r| (r.get(0), r.get(1)))?;
+                            metadata_cache.store_type(cache_key, type_metadata);
+
+                            PgTypeMetadata::from_result(Ok(type_metadata))
+                        };
+                    // let (fake_oid, fake_array_oid) = metadata_lookup.fake_oids(index);
+                    let (real_oid, real_array_oid) = unwrap_oids(&real_metadata);
+                    real_oids.extend([(*fake_oid, real_oid), (*fake_array_oid, real_array_oid)]);
+                }
+
+                // Replace fake OIDs with real OIDs in `bind_collector.metadata`
+                for m in &mut bind_collector.metadata {
+                    let (oid, array_oid) = unwrap_oids(m);
+                    *m = PgTypeMetadata::new(
+                        real_oids.get(&oid).copied().unwrap_or(oid),
+                        real_oids.get(&array_oid).copied().unwrap_or(array_oid),
+                    );
+                }
+
+                // Replace fake OIDs with real OIDs in `bind_collector.binds`
+                for (bind_index, byte_index) in fake_oid_locations {
+                    replace_fake_oid(
+                        &mut bind_collector.binds,
+                        &real_oids,
+                        bind_index,
+                        byte_index,
+                    )?;
+                }
+            }
+
+            let bind_ty = bind_collector
+                .metadata
+                .iter()
+                .map(type_from_oid)
+                .collect::<QueryResult<Vec<_>>>()?;
+
+            let bind_val = bind_collector
+                .metadata
+                .into_iter()
+                .zip(bind_collector.binds);
+
+            Ok((sql, bind_ty, bind_val))
+        }
     }
-    .await
-    .map_err(error::into_error)?
-    .try_next()
-    .await
-    .map_err(error::into_error)?
-    .ok_or_else(|| Error::NotFound)
-    .map(|r| (r.get(0), r.get(1)))
+
+    fn lookup_type(
+        &mut self,
+        schema: &Option<String>,
+        type_name: &String,
+    ) -> impl Future<Output = QueryResult<RowStreamOwned>> + Send;
+}
+
+impl Execute2 for PoolConnection<'_> {
+    async fn lookup_type(
+        &mut self,
+        schema: &Option<String>,
+        type_name: &String,
+    ) -> QueryResult<RowStreamOwned> {
+        match *schema {
+            Some(ref schema) => LOOK_UP.bind([type_name, schema]).query(self),
+            None => LOOK_UP_NO_SCHEMA.bind([type_name]).query(self),
+        }
+        .await
+        .map_err(error::into_error)
+    }
+}
+
+impl Execute2 for Transaction<PoolConnection<'_>> {
+    async fn lookup_type(
+        &mut self,
+        schema: &Option<String>,
+        type_name: &String,
+    ) -> QueryResult<RowStreamOwned> {
+        match *schema {
+            Some(ref schema) => LOOK_UP.bind([type_name, schema]).query(self),
+            None => LOOK_UP_NO_SCHEMA.bind([type_name]).query(self),
+        }
+        .await
+        .map_err(error::into_error)
+    }
 }
 
 fn type_from_oid(t: &PgTypeMetadata) -> QueryResult<Type> {
