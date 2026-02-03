@@ -1,8 +1,15 @@
 #![doc = include_str!("../README.md")]
 
+mod connection;
+mod dsl;
 mod error;
 mod row;
 mod serialize;
+
+pub use connection::AsyncPgConnection;
+pub use dsl::RunQueryDsl;
+
+pub(crate) use connection::Meta;
 
 use core::{future::Future, iter::Zip};
 
@@ -12,376 +19,36 @@ use std::{
 };
 
 use diesel::{
-    ConnectionError,
-    deserialize::FromSqlRow,
-    pg::{
-        Pg, PgMetadataCache, PgMetadataCacheKey, PgMetadataLookup, PgQueryBuilder, PgTypeMetadata,
-    },
+    pg::{Pg, PgMetadataCacheKey, PgMetadataLookup, PgQueryBuilder, PgTypeMetadata},
     query_builder::{
         AsQuery, QueryBuilder, QueryFragment, QueryId, bind_collector::RawBytesBindCollector,
     },
-    query_dsl::CompatibleType,
     result::{Error, QueryResult},
 };
-use tokio::sync::Mutex as AsyncMutex;
 use xitca_postgres::{
     Execute, RowStreamOwned,
     iter::AsyncLendingIterator,
-    pool::{CachedStatement, Pool, PoolConnection},
+    pool::{CachedStatement, PoolConnection},
     statement::{Statement, StatementNamed},
     transaction::Transaction,
     types::Type,
 };
 
-use self::{row::PgRow, serialize::ToSqlHelper};
-
 const FAKE_OID: u32 = 0;
-
-pub struct AsyncPgConnection {
-    pool: Pool,
-    meta: Meta,
-}
-
-type Meta = AsyncMutex<PgMetadataCache>;
-
-impl AsyncPgConnection {
-    pub async fn establish(url: &str) -> Result<Self, ConnectionError> {
-        let pool = Pool::builder(url)
-            .build()
-            .map_err(error::into_connection_error)?;
-
-        Ok(Self {
-            pool,
-            meta: Default::default(),
-        })
-    }
-
-    /// start a transction with given async closure.
-    /// the transaction would implicitly begin before the async closure runs and end after the closure finish.
-    /// when the async closure returns with Ok path the transaction would implicitly commit and returns with the value of OK if the commit succeed.
-    /// when the async closure returns with Err path the transaction would implicitly rollback and returns with the value of if the rollback succeed.
-    /// commit and rollback error has higher priority than the outcome of async closure.
-    pub async fn transaction<F, T>(&self, exec: F) -> QueryResult<T>
-    where
-        F: AsyncFnOnce(&mut TransactionConnection<'_>) -> QueryResult<T>,
-    {
-        let conn = self
-            .pool
-            .get()
-            .await
-            .map_err(error::into_error)?
-            .transaction_owned()
-            .await
-            .map_err(error::into_error)?;
-
-        let mut conn = TransactionConnection {
-            conn,
-            meta: &self.meta,
-        };
-
-        match exec(&mut conn).await {
-            Ok(res) => {
-                conn.conn.commit().await.map_err(error::into_error)?;
-                Ok(res)
-            }
-            Err(e) => {
-                conn.conn.rollback().await.map_err(error::into_error)?;
-                Err(e)
-            }
-        }
-    }
-}
-
-/// async version of [`diesel::query_dsl::RunQueryDsl`]
-pub trait RunQueryDsl<C>
-where
-    Self: AsQuery + Send,
-    Self::Query: QueryFragment<Pg> + QueryId + Send,
-{
-    /// async version of [`diesel::query_dsl::RunQueryDsl::execute`]
-    fn execute(self, conn: C) -> impl Future<Output = QueryResult<usize>> + Send;
-
-    #[doc(hidden)]
-    fn load_stream(self, conn: C) -> impl Future<Output = QueryResult<RowStreamOwned>> + Send;
-
-    /// async version of [`diesel::query_dsl::RunQueryDsl::load`]
-    fn load<U>(self, conn: C) -> impl Future<Output = QueryResult<Vec<U>>> + Send
-    where
-        U: FromSqlRow<<Self::SqlType as CompatibleType<U, Pg>>::SqlType, Pg> + Send,
-        C: Send,
-        Self: Sized,
-        Self::SqlType: CompatibleType<U, Pg>,
-    {
-        async {
-            let mut res = Vec::new();
-            self.load_into(conn, &mut res).await.map(|_| res)
-        }
-    }
-
-    /// alternative version of [`diesel::query_dsl::RunQueryDsl::load_iter`] where the iteration
-    /// happens inside the method with given collection type. when function returns sucessfully
-    /// the given collection type would be populated with types converted from row data
-    fn load_into<U, R>(
-        self,
-        conn: C,
-        collection: &mut R,
-    ) -> impl Future<Output = QueryResult<()>> + Send
-    where
-        U: FromSqlRow<<Self::SqlType as CompatibleType<U, Pg>>::SqlType, Pg> + Send,
-        R: Extend<U> + Send,
-        C: Send,
-        Self: Sized,
-        Self::SqlType: CompatibleType<U, Pg>,
-    {
-        async {
-            let stream = self.load_stream(conn).await?;
-            try_collect_into(stream, collection).await
-        }
-    }
-
-    /// async version of [`diesel::query_dsl::RunQueryDsl::get_result`]
-    fn get_result<U>(self, conn: C) -> impl Future<Output = QueryResult<U>> + Send
-    where
-        U: FromSqlRow<<Self::SqlType as CompatibleType<U, Pg>>::SqlType, Pg> + Send,
-        C: Send,
-        Self: Sized,
-        Self::SqlType: CompatibleType<U, Pg>,
-    {
-        async {
-            let mut stream = self.load_stream(conn).await?;
-            try_next(&mut stream).await?.ok_or_else(|| Error::NotFound)
-        }
-    }
-
-    /// async version of [`diesel::query_dsl::RunQueryDsl::get_results`]
-    #[inline]
-    fn get_results<U>(self, conn: C) -> impl Future<Output = QueryResult<Vec<U>>> + Send
-    where
-        U: FromSqlRow<<Self::SqlType as CompatibleType<U, Pg>>::SqlType, Pg> + Send,
-        C: Send,
-        Self: Sized,
-        Self::SqlType: CompatibleType<U, Pg>,
-    {
-        self.load(conn)
-    }
-
-    /// async version of [`diesel::query_dsl::RunQueryDsl::first`]
-    #[inline]
-    fn first<U>(self, conn: C) -> impl Future<Output = QueryResult<U>> + Send
-    where
-        U: FromSqlRow<
-                <<diesel::dsl::Limit<Self> as AsQuery>::SqlType as CompatibleType<U, Pg>>::SqlType,
-                Pg,
-            > + Send,
-        C: Send,
-        Self: diesel::query_dsl::methods::LimitDsl + Sized,
-        diesel::dsl::Limit<Self>: RunQueryDsl<C>,
-        <diesel::dsl::Limit<Self> as AsQuery>::Query: QueryFragment<Pg> + QueryId + Send,
-        <diesel::dsl::Limit<Self> as AsQuery>::SqlType: CompatibleType<U, Pg>,
-    {
-        diesel::query_dsl::methods::LimitDsl::limit(self, 1).get_result(conn)
-    }
-}
-
-impl<Q> RunQueryDsl<&AsyncPgConnection> for Q
-where
-    Q: AsQuery + Send,
-    Q::Query: QueryFragment<Pg> + QueryId + Send,
-{
-    async fn execute(self, conn: &AsyncPgConnection) -> QueryResult<usize> {
-        let res = {
-            let mut pool_conn = conn.pool.get().await.map_err(error::into_error)?;
-            execute(self, &mut pool_conn, &conn.meta).await?
-        }
-        .await
-        .map_err(error::into_error)?;
-
-        Ok(res as _)
-    }
-
-    async fn load_stream(self, conn: &AsyncPgConnection) -> QueryResult<RowStreamOwned> {
-        let mut pool_conn = conn.pool.get().await.map_err(error::into_error)?;
-        load(self, &mut pool_conn, &conn.meta).await
-    }
-}
 
 pub struct TransactionConnection<'a> {
     conn: Transaction<PoolConnection<'a>>,
     meta: &'a Meta,
 }
 
-impl<Q> RunQueryDsl<&mut TransactionConnection<'_>> for Q
-where
-    Q: AsQuery + Send,
-    Q::Query: QueryFragment<Pg> + QueryId + Send,
-{
-    async fn execute(self, conn: &mut TransactionConnection<'_>) -> QueryResult<usize> {
-        let res = execute_tx(self, &mut conn.conn, conn.meta)
-            .await?
-            .await
-            .map_err(error::into_error)?;
-        Ok(res as _)
-    }
-
-    async fn load_stream(
-        self,
-        conn: &mut TransactionConnection<'_>,
-    ) -> QueryResult<RowStreamOwned> {
-        load_tx(self, &mut conn.conn, conn.meta).await
-    }
-}
-
-async fn execute<Q>(
-    query: Q,
-    conn: &mut PoolConnection<'_>,
-    meta: &Meta,
-) -> QueryResult<impl Future<Output = Result<u64, xitca_postgres::Error>> + 'static>
-where
-    Q: AsQuery + Send,
-    Q::Query: QueryFragment<Pg> + QueryId + Send,
-{
-    execute_with(query, conn, meta, async |conn, stmt, bind| {
-        Ok(stmt.bind(bind.map(ToSqlHelper)).execute(&*conn))
-    })
-    .await
-}
-
-async fn load<Q>(
-    query: Q,
-    conn: &mut PoolConnection<'_>,
-    meta: &Meta,
-) -> QueryResult<RowStreamOwned>
-where
-    Q: AsQuery + Send,
-    Q::Query: QueryFragment<Pg> + QueryId + Send,
-{
-    execute_with(query, conn, meta, async |conn, stmt, bind| {
-        stmt.bind(bind.map(ToSqlHelper))
-            .into_owned()
-            .query(&*conn)
-            .await
-            .map_err(error::into_error)
-    })
-    .await
-}
-
-async fn execute_with<Q, E, R>(
-    query: Q,
-    conn: &mut PoolConnection<'_>,
-    meta: &Meta,
-    exec: E,
-) -> QueryResult<R>
-where
-    Q: AsQuery + Send,
-    Q::Query: QueryFragment<Pg> + QueryId + Send,
-    E: AsyncFnOnce(&mut PoolConnection<'_>, CachedStatement, BindValue) -> QueryResult<R>,
-{
-    let (sql, bind_types, bind_collector) = conn.pre_execute(query, meta).await?;
-
-    let stmt = xitca_postgres::Statement::named(&sql, &bind_types)
-        .execute(&mut *conn)
-        .await
-        .map_err(error::into_error)?;
-
-    exec(conn, stmt, bind_collector).await
-}
-
-// code duplication between plain connection and transaction connection due to HKT compiler bug.
-async fn execute_tx<Q>(
-    query: Q,
-    conn: &mut Transaction<PoolConnection<'_>>,
-    meta: &Meta,
-) -> QueryResult<impl Future<Output = Result<u64, xitca_postgres::Error>> + 'static>
-where
-    Q: AsQuery + Send,
-    Q::Query: QueryFragment<Pg> + QueryId + Send,
-{
-    execute_with_tx(query, conn, meta, async |conn, stmt, bind| {
-        Ok(stmt.bind(bind.map(ToSqlHelper)).execute(&*conn))
-    })
-    .await
-}
-
-async fn load_tx<Q>(
-    query: Q,
-    conn: &mut Transaction<PoolConnection<'_>>,
-    meta: &Meta,
-) -> QueryResult<RowStreamOwned>
-where
-    Q: AsQuery + Send,
-    Q::Query: QueryFragment<Pg> + QueryId + Send,
-{
-    execute_with_tx(query, conn, meta, async |conn, stmt, bind| {
-        stmt.bind(bind.map(ToSqlHelper))
-            .into_owned()
-            .query(&*conn)
-            .await
-            .map_err(error::into_error)
-    })
-    .await
-}
-
-async fn execute_with_tx<Q, E, R>(
-    query: Q,
-    conn: &mut Transaction<PoolConnection<'_>>,
-    meta: &Meta,
-    exec: E,
-) -> QueryResult<R>
-where
-    Q: AsQuery + Send,
-    Q::Query: QueryFragment<Pg> + QueryId + Send,
-    E: AsyncFnOnce(
-        &mut Transaction<PoolConnection<'_>>,
-        CachedStatement,
-        BindValue,
-    ) -> QueryResult<R>,
-{
-    let (sql, bind_types, bind_collector) = conn.pre_execute(query, meta).await?;
-
-    let stmt = xitca_postgres::Statement::named(&sql, &bind_types)
-        .execute(&mut *conn)
-        .await
-        .map_err(error::into_error)?;
-
-    exec(conn, stmt, bind_collector).await
-}
-
-async fn try_collect_into<U, St, C>(
-    mut stream: RowStreamOwned,
-    collection: &mut C,
-) -> QueryResult<()>
-where
-    U: FromSqlRow<St, Pg> + Send,
-    C: Extend<U>,
-{
-    while let Some(item) = try_next(&mut stream).await? {
-        collection.extend(Some(item));
-    }
-    Ok(())
-}
-
-async fn try_next<U, St>(stream: &mut RowStreamOwned) -> QueryResult<Option<U>>
-where
-    U: FromSqlRow<St, Pg> + Send,
-{
-    match stream.try_next().await {
-        Ok(Some(row)) => {
-            let item = U::build_from_row(&PgRow::new(row)).map_err(Error::DeserializationError)?;
-            Ok(Some(item))
-        }
-        Ok(None) => Ok(None),
-        Err(e) => Err(error::into_error(e)),
-    }
-}
-
 type BindValue = Zip<IntoIter<PgTypeMetadata>, IntoIter<Option<Vec<u8>>>>;
 
-trait Execute2: Send {
+trait PreExecute: Send {
     fn pre_execute<Q>(
         &mut self,
         query: Q,
         meta: &Meta,
-    ) -> impl Future<Output = QueryResult<(String, Vec<Type>, BindValue)>> + Send
+    ) -> impl Future<Output = QueryResult<(CachedStatement, BindValue)>> + Send
     where
         Q: AsQuery + Send,
         Q::Query: QueryFragment<Pg> + QueryId + Send,
@@ -420,7 +87,7 @@ trait Execute2: Send {
                             type_metadata
                         } else {
                             let type_metadata = self
-                                .lookup_type(schema, lookup_type_name)
+                                .lookup_type(schema.as_deref(), lookup_type_name)
                                 .await?
                                 .try_next()
                                 .await
@@ -467,25 +134,40 @@ trait Execute2: Send {
                 .into_iter()
                 .zip(bind_collector.binds);
 
-            Ok((sql, bind_ty, bind_val))
+            let stmt = self.prepare(&sql, &bind_ty).await?;
+
+            Ok((stmt, bind_val))
         }
     }
 
+    fn prepare(
+        &mut self,
+        sql: &str,
+        tys: &[Type],
+    ) -> impl Future<Output = QueryResult<CachedStatement>> + Send;
+
     fn lookup_type(
         &mut self,
-        schema: &Option<String>,
-        type_name: &String,
+        schema: Option<&str>,
+        type_name: &str,
     ) -> impl Future<Output = QueryResult<RowStreamOwned>> + Send;
 }
 
-impl Execute2 for PoolConnection<'_> {
+impl PreExecute for PoolConnection<'_> {
+    async fn prepare(&mut self, sql: &str, tys: &[Type]) -> QueryResult<CachedStatement> {
+        xitca_postgres::Statement::named(sql, tys)
+            .execute(self)
+            .await
+            .map_err(error::into_error)
+    }
+
     async fn lookup_type(
         &mut self,
-        schema: &Option<String>,
-        type_name: &String,
+        schema: Option<&str>,
+        type_name: &str,
     ) -> QueryResult<RowStreamOwned> {
-        match *schema {
-            Some(ref schema) => LOOK_UP.bind([type_name, schema]).query(self),
+        match schema {
+            Some(schema) => LOOK_UP.bind([type_name, schema]).query(self),
             None => LOOK_UP_NO_SCHEMA.bind([type_name]).query(self),
         }
         .await
@@ -493,14 +175,21 @@ impl Execute2 for PoolConnection<'_> {
     }
 }
 
-impl Execute2 for Transaction<PoolConnection<'_>> {
+impl PreExecute for Transaction<PoolConnection<'_>> {
+    async fn prepare(&mut self, sql: &str, tys: &[Type]) -> QueryResult<CachedStatement> {
+        xitca_postgres::Statement::named(sql, tys)
+            .execute(self)
+            .await
+            .map_err(error::into_error)
+    }
+
     async fn lookup_type(
         &mut self,
-        schema: &Option<String>,
-        type_name: &String,
+        schema: Option<&str>,
+        type_name: &str,
     ) -> QueryResult<RowStreamOwned> {
-        match *schema {
-            Some(ref schema) => LOOK_UP.bind([type_name, schema]).query(self),
+        match schema {
+            Some(schema) => LOOK_UP.bind([type_name, schema]).query(self),
             None => LOOK_UP_NO_SCHEMA.bind([type_name]).query(self),
         }
         .await
