@@ -8,14 +8,14 @@ use diesel::{
 use xitca_postgres::{Execute, RowStreamOwned, iter::AsyncLendingIterator};
 
 use crate::{
-    PreExecute, TransactionConnection, connection::AsyncPgConnection, error, row::PgRow,
-    serialize::ToSqlHelper,
+    BindValueIter, PreExecute, TransactionConnection, connection::AsyncPgConnection, error,
+    row::PgRow,
 };
 
 /// async version of [`diesel::query_dsl::RunQueryDsl`]
 pub trait RunQueryDsl<C>
 where
-    C: _RunQueryDsl<Self>,
+    C: _RunQueryDsl<Self> + Send,
     Self: AsQuery + Send + Sized,
     Self::Query: QueryFragment<Pg> + QueryId + Send,
 {
@@ -29,8 +29,6 @@ where
     fn load<U>(self, conn: C) -> impl Future<Output = QueryResult<Vec<U>>> + Send
     where
         U: FromSqlRow<<Self::SqlType as CompatibleType<U, Pg>>::SqlType, Pg> + Send,
-        C: Send,
-        Self: Sized,
         Self::SqlType: CompatibleType<U, Pg>,
     {
         async {
@@ -50,8 +48,6 @@ where
     where
         U: FromSqlRow<<Self::SqlType as CompatibleType<U, Pg>>::SqlType, Pg> + Send,
         R: Extend<U> + Send,
-        C: Send,
-        Self: Sized,
         Self::SqlType: CompatibleType<U, Pg>,
     {
         async {
@@ -64,8 +60,6 @@ where
     fn get_result<U>(self, conn: C) -> impl Future<Output = QueryResult<U>> + Send
     where
         U: FromSqlRow<<Self::SqlType as CompatibleType<U, Pg>>::SqlType, Pg> + Send,
-        C: Send,
-        Self: Sized,
         Self::SqlType: CompatibleType<U, Pg>,
     {
         async {
@@ -79,8 +73,6 @@ where
     fn get_results<U>(self, conn: C) -> impl Future<Output = QueryResult<Vec<U>>> + Send
     where
         U: FromSqlRow<<Self::SqlType as CompatibleType<U, Pg>>::SqlType, Pg> + Send,
-        C: Send,
-        Self: Sized,
         Self::SqlType: CompatibleType<U, Pg>,
     {
         self.load(conn)
@@ -94,8 +86,7 @@ where
                 <<diesel::dsl::Limit<Self> as AsQuery>::SqlType as CompatibleType<U, Pg>>::SqlType,
                 Pg,
             > + Send,
-        C: Send,
-        Self: diesel::query_dsl::methods::LimitDsl + Sized,
+        Self: diesel::query_dsl::methods::LimitDsl,
         diesel::dsl::Limit<Self>: RunQueryDsl<C>,
         C: _RunQueryDsl<diesel::dsl::Limit<Self>>,
         <diesel::dsl::Limit<Self> as AsQuery>::Query: QueryFragment<Pg> + QueryId + Send,
@@ -132,7 +123,7 @@ where
         let res = {
             let mut pool_conn = self.pool.get().await.map_err(error::into_error)?;
             let (stmt, bind) = pool_conn.pre_execute(query, &self.meta).await?;
-            stmt.bind(bind.map(ToSqlHelper)).execute(&pool_conn)
+            stmt.bind(BindValueIter::from(&bind)).execute(&pool_conn)
         }
         .await
         .map_err(error::into_error)?;
@@ -143,7 +134,7 @@ where
     async fn _load(self, query: Q) -> QueryResult<RowStreamOwned> {
         let mut pool_conn = self.pool.get().await.map_err(error::into_error)?;
         let (stmt, bind) = pool_conn.pre_execute(query, &self.meta).await?;
-        stmt.bind(bind.map(ToSqlHelper))
+        stmt.bind(BindValueIter::from(&bind))
             .into_owned()
             .query(&pool_conn)
             .await
@@ -159,7 +150,7 @@ where
     async fn _execute(self, query: Q) -> QueryResult<usize> {
         let (stmt, bind) = self.conn.pre_execute(query, self.meta).await?;
         let res = stmt
-            .bind(bind.map(ToSqlHelper))
+            .bind(BindValueIter::from(&bind))
             .execute(&self.conn)
             .await
             .map_err(error::into_error)?;
@@ -168,7 +159,7 @@ where
 
     async fn _load(self, query: Q) -> QueryResult<RowStreamOwned> {
         let (stmt, bind) = self.conn.pre_execute(query, self.meta).await?;
-        stmt.bind(bind.map(ToSqlHelper))
+        stmt.bind(BindValueIter::from(&bind))
             .into_owned()
             .query(&self.conn)
             .await

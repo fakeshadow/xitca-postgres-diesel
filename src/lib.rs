@@ -11,12 +11,9 @@ pub use dsl::RunQueryDsl;
 
 pub(crate) use connection::Meta;
 
-use core::{future::Future, iter::Zip};
+use core::future::Future;
 
-use std::{
-    collections::{HashMap, HashSet},
-    vec::IntoIter,
-};
+use std::collections::{HashMap, HashSet};
 
 use diesel::{
     pg::{Pg, PgMetadataCacheKey, PgMetadataLookup, PgQueryBuilder, PgTypeMetadata},
@@ -34,6 +31,8 @@ use xitca_postgres::{
     types::Type,
 };
 
+use crate::serialize::ToSqlHelper;
+
 const FAKE_OID: u32 = 0;
 
 pub struct TransactionConnection<'a> {
@@ -41,14 +40,12 @@ pub struct TransactionConnection<'a> {
     meta: &'a Meta,
 }
 
-type BindValue = Zip<IntoIter<PgTypeMetadata>, IntoIter<Option<Vec<u8>>>>;
-
 trait PreExecute: Send {
     fn pre_execute<Q>(
         &mut self,
         query: Q,
         meta: &Meta,
-    ) -> impl Future<Output = QueryResult<(CachedStatement, BindValue)>> + Send
+    ) -> impl Future<Output = QueryResult<(CachedStatement, RawBytesBindCollector<Pg>)>> + Send
     where
         Q: AsQuery + Send,
         Q::Query: QueryFragment<Pg> + QueryId + Send,
@@ -58,17 +55,12 @@ trait PreExecute: Send {
 
             let mut query_builder = PgQueryBuilder::default();
 
-            let bind_data = construct_bind_data(&query)?;
+            let (fake_oid_locations, generated_oids, mut bind_collector) =
+                construct_bind_data(&query)?;
 
             query.to_sql(&mut query_builder, &Pg)?;
 
             let sql = query_builder.finish();
-
-            let BindData {
-                fake_oid_locations,
-                generated_oids,
-                mut bind_collector,
-            } = bind_data;
 
             if let Some(ref unresolved_types) = generated_oids {
                 let metadata_cache = &mut *meta.lock().await;
@@ -129,14 +121,9 @@ trait PreExecute: Send {
                 .map(type_from_oid)
                 .collect::<QueryResult<Vec<_>>>()?;
 
-            let bind_val = bind_collector
-                .metadata
-                .into_iter()
-                .zip(bind_collector.binds);
-
             let stmt = self.prepare(&sql, &bind_ty).await?;
 
-            Ok((stmt, bind_val))
+            Ok((stmt, bind_collector))
         }
     }
 
@@ -212,11 +199,11 @@ fn type_from_oid(t: &PgTypeMetadata) -> QueryResult<Type> {
     }))
 }
 
-struct BindData {
-    fake_oid_locations: Vec<(usize, usize)>,
-    generated_oids: GeneratedOidTypeMap,
-    bind_collector: RawBytesBindCollector<Pg>,
-}
+type BindData = (
+    Vec<(usize, usize)>,
+    GeneratedOidTypeMap,
+    RawBytesBindCollector<Pg>,
+);
 
 fn construct_bind_data(query: &dyn QueryFragment<Pg>) -> Result<BindData, Error> {
     // we don't resolve custom types here yet, we do that later
@@ -333,19 +320,15 @@ fn construct_bind_data(query: &dyn QueryFragment<Pg>) -> Result<BindData, Error>
         // Avoid storing the bind collectors in the returned Future
         .collect();
 
-        collect_bind_result_0
-            .and(collect_bind_result_1)
-            .map(|_| BindData {
+        collect_bind_result_0.and(collect_bind_result_1).map(|_| {
+            (
                 fake_oid_locations,
-                generated_oids: metadata_lookup_1.generated_oids,
-                bind_collector: bind_collector_1,
-            })
-    } else {
-        collect_bind_result_0.map(|_| BindData {
-            fake_oid_locations: Vec::new(),
-            generated_oids: None,
-            bind_collector: bind_collector_0,
+                metadata_lookup_1.generated_oids,
+                bind_collector_1,
+            )
         })
+    } else {
+        collect_bind_result_0.map(|_| (Vec::new(), None, bind_collector_0))
     }
 }
 
@@ -425,3 +408,52 @@ fn replace_fake_oid(
             )
         })
 }
+
+#[derive(Clone)]
+struct BindValueIter<'a> {
+    meta: &'a [diesel::pg::PgTypeMetadata],
+    bind: &'a [Option<Vec<u8>>],
+    offset: usize,
+}
+
+impl<'a> From<&'a RawBytesBindCollector<Pg>> for BindValueIter<'a> {
+    fn from(value: &'a RawBytesBindCollector<Pg>) -> Self {
+        debug_assert_eq!(
+            value.metadata.len(),
+            value.binds.len(),
+            "meta type and value binding must be the same in length"
+        );
+
+        Self {
+            meta: &value.metadata,
+            bind: &value.binds,
+            offset: 0,
+        }
+    }
+}
+
+impl<'a> Iterator for BindValueIter<'a> {
+    type Item = ToSqlHelper<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.offset == self.meta.len() {
+            return None;
+        }
+
+        let ret = Some(ToSqlHelper(
+            &self.meta[self.offset],
+            self.bind[self.offset].as_deref(),
+        ));
+
+        self.offset += 1;
+
+        ret
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let rem = self.meta.len() - self.offset;
+        (rem, Some(rem))
+    }
+}
+
+impl ExactSizeIterator for BindValueIter<'_> {}
