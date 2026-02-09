@@ -8,8 +8,11 @@ use diesel::{
 use xitca_postgres::{Execute, RowStreamOwned, iter::AsyncLendingIterator};
 
 use crate::{
-    BindValueIter, PreExecute, TransactionConnection, connection::AsyncPgConnection, error,
+    connection::AsyncPgConnection,
+    error,
+    pre_execute::{BindValueIter, PreExecute},
     row::PgRow,
+    transaction::TransactionConnection,
 };
 
 /// async version of [`diesel::query_dsl::RunQueryDsl`]
@@ -103,6 +106,13 @@ where
 {
 }
 
+impl<Q> RunQueryDsl<&mut TransactionConnection<'_, '_>> for Q
+where
+    Q: AsQuery + Send,
+    Q::Query: QueryFragment<Pg> + QueryId + Send,
+{
+}
+
 #[doc(hidden)]
 pub trait _RunQueryDsl<Q>
 where
@@ -142,26 +152,26 @@ where
     }
 }
 
-impl<Q> _RunQueryDsl<Q> for &mut TransactionConnection<'_>
+impl<Q> _RunQueryDsl<Q> for &mut TransactionConnection<'_, '_>
 where
     Q: AsQuery + Send,
     Q::Query: QueryFragment<Pg> + QueryId + Send,
 {
     async fn _execute(self, query: Q) -> QueryResult<usize> {
-        let (stmt, bind) = self.conn.pre_execute(query, self.meta).await?;
+        let (stmt, bind) = self.tx.pre_execute(query, self.meta).await?;
         let res = stmt
             .bind(BindValueIter::from(&bind))
-            .execute(&self.conn)
+            .execute(&self.tx)
             .await
             .map_err(error::into_error)?;
         Ok(res as _)
     }
 
     async fn _load(self, query: Q) -> QueryResult<RowStreamOwned> {
-        let (stmt, bind) = self.conn.pre_execute(query, self.meta).await?;
+        let (stmt, bind) = self.tx.pre_execute(query, self.meta).await?;
         stmt.bind(BindValueIter::from(&bind))
             .into_owned()
-            .query(&self.conn)
+            .query(&self.tx)
             .await
             .map_err(error::into_error)
     }
