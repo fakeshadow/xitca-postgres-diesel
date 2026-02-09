@@ -12,7 +12,7 @@ use crate::{
     error,
     pre_execute::{BindValueIter, PreExecute},
     row::PgRow,
-    transaction::TransactionConnection,
+    transaction::Transaction,
 };
 
 /// async version of [`diesel::query_dsl::RunQueryDsl`]
@@ -106,7 +106,7 @@ where
 {
 }
 
-impl<Q> RunQueryDsl<&mut TransactionConnection<'_, '_>> for Q
+impl<Q> RunQueryDsl<&mut Transaction<'_, '_>> for Q
 where
     Q: AsQuery + Send,
     Q::Query: QueryFragment<Pg> + QueryId + Send,
@@ -152,7 +152,7 @@ where
     }
 }
 
-impl<Q> _RunQueryDsl<Q> for &mut TransactionConnection<'_, '_>
+impl<Q> _RunQueryDsl<Q> for &mut Transaction<'_, '_>
 where
     Q: AsQuery + Send,
     Q::Query: QueryFragment<Pg> + QueryId + Send,

@@ -1,23 +1,25 @@
 use diesel::QueryResult;
-use xitca_postgres::{pool::PoolConnection, transaction::Transaction};
+use xitca_postgres::pool::PoolConnection;
 
 use crate::{connection::Meta, error};
 
-pub struct TransactionConnection<'a, 'b> {
-    pub(crate) tx: Transaction<'a, PoolConnection<'b>>,
+type _Transaction<'a, 'b> = xitca_postgres::transaction::Transaction<'a, PoolConnection<'b>>;
+
+pub struct Transaction<'a, 'b> {
+    pub(crate) tx: _Transaction<'a, 'b>,
     pub(crate) meta: &'a Meta,
 }
 
-impl<'b> TransactionConnection<'_, 'b> {
+impl<'b> Transaction<'_, 'b> {
     pub(crate) async fn run<'a, F, T>(
-        tx: Transaction<'a, PoolConnection<'b>>,
+        tx: _Transaction<'a, 'b>,
         meta: &'a Meta,
         exec: F,
     ) -> QueryResult<T>
     where
-        F: AsyncFnOnce(&mut TransactionConnection<'_, '_>) -> QueryResult<T>,
+        F: AsyncFnOnce(&mut Transaction<'_, '_>) -> QueryResult<T>,
     {
-        let mut tx = TransactionConnection { tx, meta };
+        let mut tx = Transaction { tx, meta };
         match exec(&mut tx).await {
             Ok(res) => {
                 tx.tx.commit().await.map_err(error::into_error)?;
@@ -37,9 +39,9 @@ impl<'b> TransactionConnection<'_, 'b> {
     /// savepoint release and rollback error has higher priority than the outcome of async closure.
     pub async fn transaction<F, T>(&mut self, exec: F) -> QueryResult<T>
     where
-        F: AsyncFnOnce(&mut TransactionConnection<'_, '_>) -> QueryResult<T>,
+        F: AsyncFnOnce(&mut Transaction<'_, '_>) -> QueryResult<T>,
     {
         let tx = self.tx.transaction().await.map_err(error::into_error)?;
-        TransactionConnection::run(tx, self.meta, exec).await
+        Transaction::run(tx, self.meta, exec).await
     }
 }

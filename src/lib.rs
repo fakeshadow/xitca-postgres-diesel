@@ -10,3 +10,4 @@ mod transaction;
 
 pub use connection::AsyncPgConnection;
 pub use dsl::RunQueryDsl;
+pub use transaction::Transaction;

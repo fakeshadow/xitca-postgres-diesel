@@ -1,7 +1,7 @@
 use diesel::{ConnectionError, pg::PgMetadataCache, result::QueryResult};
 use xitca_postgres::pool::Pool;
 
-use crate::{error, transaction::TransactionConnection};
+use crate::{error, transaction::Transaction};
 
 pub struct AsyncPgConnection {
     pub(crate) pool: Pool,
@@ -62,11 +62,11 @@ impl AsyncPgConnection {
     /// ```
     pub async fn transaction<F, T>(&self, exec: F) -> QueryResult<T>
     where
-        F: AsyncFnOnce(&mut TransactionConnection<'_, '_>) -> QueryResult<T>,
+        F: AsyncFnOnce(&mut Transaction<'_, '_>) -> QueryResult<T>,
     {
         let mut conn = self.pool.get().await.map_err(error::into_error)?;
         let tx = conn.transaction().await.map_err(error::into_error)?;
-        TransactionConnection::run(tx, &self.meta, exec).await
+        Transaction::run(tx, &self.meta, exec).await
     }
 }
 
