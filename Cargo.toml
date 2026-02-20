@@ -16,6 +16,3 @@ xitca-postgres = { version = "0.4.0" }
 diesel-async = { version = "0.7.3", features = ["bb8", "postgres"] }
 futures-util = "0.3"
 tokio = { version = "1.40.0", features = ["macros", "rt-multi-thread"] }
-
-[patch.crates-io]
-xitca-postgres = { path = "../xitca-web/postgres" }
