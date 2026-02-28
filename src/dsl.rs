@@ -15,6 +15,8 @@ use crate::{
     transaction::Transaction,
 };
 
+pub type RowStream<'a, U> = futures_core::stream::BoxStream<'a, QueryResult<U>>;
+
 /// async version of [`diesel::query_dsl::RunQueryDsl`]
 pub trait RunQueryDsl<C>
 where
@@ -56,6 +58,28 @@ where
         async {
             let stream = conn._load(self).await?;
             try_collect_into(stream, collection).await
+        }
+    }
+
+    /// async version of [`diesel::query_dsl::RunQueryDsl::load_iter`]
+    ///
+    /// the output is an async iterator impl [`futures_core::Stream`] trait
+    fn load_iter<'a, U>(self, conn: C) -> impl Future<Output = QueryResult<RowStream<'a, U>>> + Send
+    where
+        U: FromSqlRow<<Self::SqlType as CompatibleType<U, Pg>>::SqlType, Pg> + Send + 'a,
+        Self::SqlType: CompatibleType<U, Pg>,
+    {
+        async {
+            let mut stream = conn._load(self).await?;
+            Ok(Box::pin(async_stream::stream! {
+                loop {
+                    match try_next(&mut stream).await {
+                        Ok(Some(item)) => yield Ok(item),
+                        Err(e) => yield Err(e),
+                        Ok(None) => return
+                    }
+                }
+            }) as _)
         }
     }
 
